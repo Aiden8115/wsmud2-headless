@@ -1,0 +1,4 @@
+// 自动生成：由 CMake configure_file 将 raid_interp.js 内嵌为 C++ 字符串
+#pragma once
+
+static const char INTERP_JS[] = R"INTERPJS(@INTERP_SRC@)INTERPJS";
