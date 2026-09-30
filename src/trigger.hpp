@@ -14,10 +14,11 @@ namespace trigger {
 
 // 单个触发器（与扩展本地存储 JSON 结构一致）
 struct Trigger {
-    std::string name;                            // 触发器名（同一角色内唯一）
+    std::string name;                            // 触发器名（同一玩家内唯一）
     std::string event;                           // 事件模板名（如 "新聊天信息"）
     std::map<std::string, std::string> conditions;  // 过滤条件：键=条件名，值=用户填写值
     std::string source;                          // Raid 脚本源码
+    std::string owner;                           // 归属玩家名；空串=全局共享（所有玩家生效，不进入某玩家 F8 编辑列表）
     bool active = false;                         // 是否启用
     std::string author;                          // 分享作者（可选）
 };
@@ -62,6 +63,8 @@ public:
 
     // 从 trigger.json 加载到输出列表（静态，不依赖实例）；校验失败返回 false+err
     static bool load_from_file(const std::string& path, std::vector<Trigger>& out, std::string& err);
+    // 把触发器列表序列化为 trigger.json 顶层文本（含 version，source 用数组格式，键与 load_from_file 一致）
+    static std::string dump_triggers(const std::vector<Trigger>& ts);
     // 用新配置整体替换本引擎触发器（不落盘）
     void replace(const std::vector<Trigger>& ts);
 
@@ -89,6 +92,18 @@ public:
     // 事件模板清单：事件名 + 该事件的过滤器（条件键, 断言类型中文名），供编辑屏/创建屏使用
     static std::vector<std::string> event_names();
     static std::vector<std::pair<std::string, std::string>> event_filters(const std::string& event);
+
+    // 表单字段：驱动 TUI 条件键编辑器
+    struct CondField {
+        std::string key;                  // 条件键名
+        std::string label;                // 中文说明
+        std::string type;                 // "text"=自由文本  "int"=整数  "enum"=从 options 选
+        std::vector<std::string> options; // enum 时的候选取值（type 键依事件而异）
+    };
+    // 该事件无条件表字段（键+label+类型+枚举候选）
+    static std::vector<CondField> cond_fields(const std::string& event);
+    // 事件英文枚举 → 中文标签
+    static const char* event_label(const std::string& event);
 
     // ---------- 事件入口（由 Account::on_json 分发） ----------
     void on_text(const std::string& msg);                                   // 新提示信息 + 战斗脱离启发

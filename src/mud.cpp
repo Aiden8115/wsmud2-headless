@@ -230,13 +230,13 @@ void Account::on_message(const std::string& text) {
             log("[文本] " + text);
             return;
         }
-        on_json(v);
+        on_json(v, text);
     } else {
         log("[文本] " + text);
     }
 }
 
-void Account::on_json(const json::Value& v) {
+void Account::on_json(const json::Value& v, const std::string& raw) {
     const std::string type = v.get("type").as_string();
 
     if (type == "roles") {
@@ -258,8 +258,7 @@ void Account::on_json(const json::Value& v) {
             }
             std::string list;
             for (std::size_t i = 0; i < roles.size(); ++i)
-                list += "\n  [" + std::to_string(i + 1) + "] " + roles[i].name +
-                        " (" + roles[i].title + ") Lv." + std::to_string(roles[i].level);
+                list += "\n  [" + std::to_string(i + 1) + "] " + roles[i].name + " (" + roles[i].title + ")";
             log("角色列表:" + list);
             need = Need::Role;
             prompt = "账号" + std::to_string(index) + " 请选择角色 [1-" + std::to_string(roles.size()) + "]：";
@@ -282,7 +281,7 @@ void Account::on_json(const json::Value& v) {
             last_error.clear();
             set_stage(Stage::Online, now_ms(), 0);
             last_ping_ms = now_ms();
-            log("★ 进入游戏成功！玩家: " + role.name + " Lv." + std::to_string(role.level) + "（挂机中）");
+            log("进入游戏成功！玩家: " + role.name + " Lv." + std::to_string(role.level));
             return;
         }
         return;
@@ -378,6 +377,9 @@ void Account::on_json(const json::Value& v) {
         else if (dialog == "pm") trig_on_pm(v);
         else if (dialog == "events") trig_on_events(v);
     }
+    // 走到这里说明该包未显示在聊天区/文本区：status/combat/die/dispfm/sc/items/
+    // itemadd/itemremove/state/room、dialog 包及未知类型 → 记入右侧"网络包"栏
+    log_pkt(raw);
 }
 
 bool Account::send_command(const std::string& cmd) {
@@ -436,7 +438,22 @@ void Account::init_triggers() {
     my_idle = false;
     my_idle_start_ms = 0;
     my_status.clear();
+    sync_triggers();   // 玩家名已确定，按 owner 过滤加载该玩家的触发器
     log("[触发] 触发器引擎就绪");
+}
+
+// 注入全局触发器全集（未过滤），并按当前玩家过滤同步到引擎
+void Account::set_triggers_all(const std::vector<trigger::Trigger>& all) {
+    all_triggers_ = all;
+    sync_triggers();
+}
+
+// 按归属玩家过滤：引擎执行 owner==my_name 的私有触发器 + owner 空的全局共享触发器
+void Account::sync_triggers() {
+    std::vector<trigger::Trigger> mine;
+    for (const auto& t : all_triggers_)
+        if (t.owner == my_name || t.owner.empty()) mine.push_back(t);
+    trig.replace(mine);
 }
 
 void Account::update_idle(int64_t now) {

@@ -77,6 +77,8 @@ public:
 Value parse(const std::string& text, std::string* err = nullptr);
 // 序列化为紧凑 JSON（字符串一律用双引号）
 std::string dump(const Value& value);
+// 序列化为带缩进的美化 JSON（2 空格缩进），供写盘/配置等需人工可读的场景
+std::string dump_pretty(const Value& value);
 
 }  // namespace json
 }  // namespace wsmud

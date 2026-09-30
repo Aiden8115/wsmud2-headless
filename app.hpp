@@ -25,9 +25,11 @@ extern int sel;                       // 当前选中槽位（0-based）
 extern bool game_mode;                // F6：false=程序命令 true=游戏命令
 extern std::vector<std::vector<std::string>> acc_logs;        // 每账号独立日志缓冲（文本区，全屏模式）
 extern std::vector<std::vector<std::string>> acc_chat_logs;   // 每账号独立聊天缓冲（聊天区，全屏模式）
+extern std::vector<std::vector<std::string>> acc_pkt_logs;    // 每账号独立网络包缓冲（右侧"网络包"栏，全屏模式）
 extern std::string cmd_buf;           // 命令行当前输入
-extern int scroll_offset;             // 日志区向上滚动行数（0=显示最新）
-extern int chat_scroll_offset;        // 聊天区向上滚动行数（0=显示最新，Shift+↑/↓）
+extern int scroll_offset;            // 日志区向上滚动行数（0=显示最新）
+extern int chat_scroll_offset;       // 聊天区向上滚动行数（0=显示最新，Shift+↑/↓）
+extern int pkt_scroll_offset;        // 网络包栏向上滚动行数（0=显示最新，[上翻 / ]下翻）
 extern bool g_tui;                    // true=全屏 TUI，false=经典行式输出
 
 // 输入阶段：None=命令  Account=录入账号  Password=录入密码
@@ -49,6 +51,28 @@ struct ClickZone {
 };
 extern std::vector<ClickZone> g_zones;
 
+// 触发器编辑屏状态（在内存配置上编辑，Esc 放弃，s 保存走原子写回）
+struct TrigEditor {
+    bool active = false;      // 是否处于编辑屏
+    bool editing = false;     // 正在编辑某个文本字段的值
+    std::string buf;          // 正编辑的文本缓冲
+    int target = -1;          // >=0 编辑已有触发器的 idx；-1=新增
+    int focus = 0;            // 焦点字段行（0=名称 1=事件 2=启用 3..=条件 最后=source）
+    std::string name;
+    std::string event = "hint";
+    bool active_flag = true;
+    std::map<std::string, std::string> conds;
+    std::string source;
+    std::vector<wsmud::trigger::Engine::CondField> fields;  // 当前 event 的条件字段缓存
+    // source 多行编辑屏（focus 到 source 行按 Enter 打开；Enter 换行，Esc 保存并返回表单）
+    bool src_active = false;
+    std::vector<std::string> src_lines;   // 多行缓冲（退出时 join '\n' 写回 source）
+    int src_row = 0;                      // 光标行
+    int src_col = 0;                      // 光标列（字节偏移）
+    int src_off = 0;                      // 首行滚动偏移
+};
+extern TrigEditor trig_editor;
+
 // 当前生效的全局触发器配置（来自软件同级目录 trigger.json，程序只读不写）
 extern std::vector<wsmud::trigger::Trigger> g_trig_cfg;
 
@@ -58,6 +82,8 @@ extern std::vector<wsmud::trigger::Trigger> g_trig_cfg;
 void out(const std::string& line);
 void account_log(int index, const std::string& line);
 void account_chat(int index, const std::string& line);
+void account_packet(int index, const std::string& line);
+void pkt_scroll(bool up);             // [ 上翻 / ] 下翻网络包栏
 void backspace_utf8(std::string& s);  // UTF-8 整字退格删除（中文等 3 字节字符一次删完）
 
 // commands.cpp：程序命令处理
@@ -65,6 +91,7 @@ const char* stage_name(Account::Stage s);
 std::string trim(const std::string& s);
 bool parse_int(const std::string& s, int& out);
 void reload_triggers();   // 重载软件同级 trigger.json（失败保留当前配置）
+void persist_triggers();  // 把内存配置原子写回 trigger.json（写前往返校验，失败保留内存配置）
 void process_line(const std::string& raw);
 
 // tui_ui.cpp：全屏 TUI 状态机 + 渲染 + 运行循环

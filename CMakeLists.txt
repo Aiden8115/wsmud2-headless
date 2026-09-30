@@ -23,6 +23,7 @@ add_executable(wsmud2_headless
     src/mud.cpp
     src/tui.cpp
     src/trigger.cpp
+    src/color.cpp
     src/quickjs/quickjs.c
 )
 

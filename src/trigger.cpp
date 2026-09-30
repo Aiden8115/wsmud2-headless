@@ -242,6 +242,69 @@ const EventDef* find_event(const std::string& name) {
     return nullptr;
 }
 
+// ---------- 表单元数据（供 TUI 编辑屏驱动） ----------
+
+// 事件名的中文标签
+const char* event_label_name(const std::string& ev) {
+    if (ev == "hint") return "新提示信息";
+    if (ev == "social") return "社交消息";
+    if (ev == "auction") return "拍卖查询";
+    if (ev == "activity") return "活动事件";
+    if (ev == "chat") return "新聊天信息";
+    if (ev == "char_refresh") return "人物刷新";
+    if (ev == "item_pickup") return "物品拾取";
+    if (ev == "buff_change") return "Buff状态改变";
+    if (ev == "combat") return "战斗状态切换";
+    if (ev == "death") return "死亡状态改变";
+    if (ev == "time_reached") return "时辰已到";
+    if (ev == "skill_cast") return "技能释放";
+    if (ev == "skill_cd") return "技能冷却结束";
+    if (ev == "hp_mp") return "气血内力改变";
+    if (ev == "damage_full") return "伤害已满";
+    return ev.c_str();
+}
+
+// 条件键的中文说明
+const char* cond_label_name(const std::string& key) {
+    if (key == "keyword") return "任意文本（包含匹配）";
+    if (key == "name") return "活动名称";
+    if (key == "item_level") return "颜色等级";
+    if (key == "channel") return "频道";
+    if (key == "speaker") return "发言人";
+    if (key == "ignore_speaker") return "忽略的发言人";
+    if (key == "char_name") return "人物名称";
+    if (key == "name_keyword") return "名称关键字";
+    if (key == "change_type") return "变化类型";
+    if (key == "buff_id") return "Buff ID";
+    if (key == "target") return "触发对象";
+    if (key == "type") return "类型";
+    if (key == "hour") return "时（0-23）";
+    if (key == "minute") return "分（0-59）";
+    if (key == "second") return "秒（0-59）";
+    if (key == "skill_id") return "技能名称";
+    if (key == "when") return "触发时机";
+    if (key == "value_type") return "值类型";
+    if (key == "value") return "阈值";
+    return key.c_str();
+}
+
+// 枚举候选（依事件给 type 键不同取值）；非枚举键返回空
+std::vector<std::string> cond_options(const std::string& event, const std::string& key) {
+    std::vector<std::string> out;
+    if (key == "channel") { out = {"全部", "世界", "队伍", "门派", "全区", "帮派", "谣言", "系统"}; }
+    else if (key == "item_level") { out = {"0", "1", "2", "3", "4", "5"}; }
+    else if (key == "change_type") { out = {"新增", "移除", "层数刷新"}; }
+    else if (key == "target") { out = {"自己", "他人"}; }
+    else if (key == "when") { out = {"低于", "高于"}; }
+    else if (key == "value_type") { out = {"百分比", "数值"}; }
+    else if (key == "type") {
+        if (event == "combat") out = {"进入战斗", "脱离战斗"};
+        else if (event == "death") out = {"已经死亡", "已经复活"};
+        else if (event == "hp_mp") out = {"气血", "内力"};
+    }
+    return out;
+}
+
 // 单个候选的字符串断言（不含 || 或；空/通配已在上层处理）
 bool assert_single(FilterType ty, const std::string& user, const std::string& game) {
     switch (ty) {
@@ -1014,7 +1077,6 @@ bool Engine::update(std::size_t idx, const std::string& name, const std::string&
         if (i != idx && triggers_[i].name == name) { err = "无法修改名称，已经存在同名触发器！"; return false; }
     const EventDef* ev = find_event(event);
     if (!ev) { err = "未知事件类型"; return false; }
-    if (source.empty()) { err = "触发器缺少脚本源码"; return false; }
     Trigger& t = triggers_[idx];
     t.name = name;
     t.event = event;
@@ -1036,7 +1098,6 @@ bool Engine::add(const std::string& name, const std::string& event,
         if (t.name == name) { err = "无法修改名称，已经存在同名触发器！"; return false; }
     const EventDef* ev = find_event(event);
     if (!ev) { err = "未知事件类型"; return false; }
-    if (source.empty()) { err = "触发器缺少脚本源码"; return false; }
     Trigger tg;
     tg.name = name;
     tg.event = event;
@@ -1069,6 +1130,25 @@ std::vector<std::pair<std::string, std::string>> Engine::event_filters(const std
         out.emplace_back(ev->filters[i].name, filter_type_name(ev->filters[i].type));
     return out;
 }
+
+// 该事件的条件键表单字段（含中文说明、值类型、枚举候选）。供 TUI 编辑屏驱动。
+std::vector<Engine::CondField> Engine::cond_fields(const std::string& event) {
+    std::vector<CondField> out;
+    const EventDef* ev = find_event(event);
+    if (!ev) return out;
+    for (int i = 0; i < ev->nfilters; ++i) {
+        CondField f;
+        f.key = ev->filters[i].name;
+        f.label = cond_label_name(f.key);
+        f.type = is_int_key(f.key) ? "int" : "text";
+        auto opts = cond_options(event, f.key);
+        if (!opts.empty()) { f.type = "enum"; f.options = std::move(opts); }
+        out.push_back(std::move(f));
+    }
+    return out;
+}
+
+const char* Engine::event_label(const std::string& event) { return event_label_name(event); }
 
 void Engine::load() {
     if (save_path_.empty()) return;
@@ -1133,11 +1213,12 @@ bool Engine::load_from_file(const std::string& path, std::vector<Trigger>& out, 
         t.name = it.get("name").as_string();
         if (!name_ok(t.name)) { err = "触发器名称非法（只能使用中文、英文和数字字符）"; return false; }
         for (const auto& ot : parsed)
-            if (ot.name == t.name) { err = "存在同名触发器「" + t.name + "」"; return false; }
+            if (ot.owner == t.owner && ot.name == t.name) { err = "存在同名触发器「" + t.name + "」"; return false; }
         t.event = it.get("event").as_string();
         if (!find_event(t.event)) { err = "触发器「" + t.name + "」的事件类型未知：" + t.event; return false; }
         t.active = it.get("active").as_bool(false);
         t.author = it.get("author").as_string();
+        t.owner = it.get("owner").as_string();   // 空串=全局共享；否则归属该玩家
         const json::Value& conds = it.get("conditions");
         if (conds.is_object()) {
             for (const auto& kv : conds.as_object()) {
@@ -1165,7 +1246,7 @@ bool Engine::load_from_file(const std::string& path, std::vector<Trigger>& out, 
                 t.source += val_str(el);
             }
         }
-        if (t.source.empty()) { err = "触发器「" + t.name + "」缺少脚本源码"; return false; }
+        // 允许空 source（TUI 编辑时可先存骨架再补充脚本）
         parsed.push_back(std::move(t));
     }
     out = std::move(parsed);
@@ -1174,6 +1255,36 @@ bool Engine::load_from_file(const std::string& path, std::vector<Trigger>& out, 
 
 void Engine::replace(const std::vector<Trigger>& ts) {
     triggers_ = ts;
+}
+
+// 把触发器列表序列化为 trigger.json 顶层文本。
+// source 统一输出为数组（一行一条）；条件对象键为 conditions（与 load_from_file 读取一致）。
+std::string Engine::dump_triggers(const std::vector<Trigger>& ts) {
+    json::Value::Array arr;
+    for (const auto& t : ts) {
+        json::Value::Object obj;
+        obj["name"] = json::Value(t.name);
+        obj["event"] = json::Value(t.event);
+        obj["active"] = json::Value(t.active);
+        obj["owner"] = json::Value(t.owner);   // 归属玩家名；空串=全局共享
+        json::Value::Object conds;
+        for (const auto& kv : t.conditions)
+            conds[kv.first] = json::Value(kv.second);
+        obj["conditions"] = json::Value(std::move(conds));
+        json::Value::Array src;
+        std::string line;
+        for (char c : t.source) {
+            if (c == '\n') { src.push_back(json::Value(std::move(line))); line.clear(); }
+            else line += c;
+        }
+        src.push_back(json::Value(std::move(line)));
+        obj["source"] = json::Value(std::move(src));
+        arr.push_back(json::Value(std::move(obj)));
+    }
+    json::Value::Object top;
+    top["version"] = json::Value(1);
+    top["triggers"] = json::Value(std::move(arr));
+    return json::dump_pretty(json::Value(std::move(top)));
 }
 
 }  // namespace trigger

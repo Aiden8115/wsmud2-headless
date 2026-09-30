@@ -94,6 +94,19 @@ std::string fit(const std::string& s, std::size_t width, bool pad_left) {
     std::string out;
     std::size_t w = 0;
     for (std::size_t i = 0; i < s.size();) {
+        if (s[i] == 0x1b) {  // ANSI 转义序列：不占显示宽度，原样透传（含 SGR 颜色，供编辑器行内高亮）
+            if (i + 1 < s.size() && s[i + 1] == '[') {
+                std::size_t j = i + 2;
+                while (j < s.size() && (s[j] < 0x40 || s[j] > 0x7e)) ++j;  // 参数
+                if (j < s.size()) ++j;                                      // 最终字节
+                out.append(s, i, j - i);
+                i = j;
+                continue;
+            }
+            out += s[i];  // 孤立 ESC，当普通字节
+            ++i;
+            continue;
+        }
         std::size_t n = seq_len(static_cast<unsigned char>(s[i]));
         if (i + n > s.size()) break;
         std::uint32_t cp = decode_cp(s.data() + i, n);
@@ -108,6 +121,76 @@ std::string fit(const std::string& s, std::size_t width, bool pad_left) {
         return std::string(pad, ' ') + out;
     }
     out.append(pad, ' ');
+    return out;
+}
+
+std::size_t display_width(const std::string& s) {
+    std::size_t w = 0;
+    for (std::size_t i = 0; i < s.size();) {
+        if (s[i] == 0x1b) {   // 转义序列（含颜色码）不占显示宽度
+            if (i + 1 < s.size() && s[i + 1] == '[') {
+                std::size_t j = i + 2;
+                while (j < s.size() && (s[j] < 0x40 || s[j] > 0x7e)) ++j;
+                if (j < s.size()) ++j;
+                i = j;
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        std::size_t n = seq_len(static_cast<unsigned char>(s[i]));
+        if (i + n > s.size()) break;
+        w += is_wide(decode_cp(s.data() + i, n)) ? 2 : 1;
+        i += n;
+    }
+    return w;
+}
+
+// 按显示宽度折行（不切断字符、不破坏 UTF-8，转义序列按 0 宽度随行拷贝）；
+// 每段显示宽度 ≤ width，返回各段。供右侧网络包栏把超宽的 JSON 行折成多行
+std::vector<std::string> wrap_utf8(const std::string& line, int width) {
+    std::vector<std::string> out;
+    if (width <= 0) {
+        if (!line.empty()) out.push_back(line);
+        return out;
+    }
+    std::string cur;
+    std::size_t w = 0;
+    for (std::size_t i = 0; i < line.size();) {
+        if (line[i] == 0x1b) {   // 防御：完整转义序列随行拷贝（不触发换行）
+            if (i + 1 < line.size() && line[i + 1] == '[') {
+                std::size_t j = i + 2;
+                while (j < line.size() && (static_cast<unsigned char>(line[j]) < 0x40 || static_cast<unsigned char>(line[j]) > 0x7e)) ++j;
+                if (j < line.size()) ++j;
+                cur.append(line, i, j - i);
+                i = j;
+                continue;
+            }
+            cur += line[i];
+            ++i;
+            continue;
+        }
+        std::size_t n = seq_len(static_cast<unsigned char>(line[i]));
+        if (i + n > line.size()) break;
+        std::uint32_t cp = decode_cp(line.data() + i, n);
+        std::size_t cw = is_wide(cp) ? 2 : 1;
+        if (w + cw > static_cast<std::size_t>(width) && !cur.empty()) {
+            out.push_back(cur);   // 当前行放不下，先换行再重试该字符
+            cur.clear();
+            w = 0;
+            continue;
+        }
+        if (w + cw > static_cast<std::size_t>(width)) {
+            // 单字符大于栏宽（极窄终端兜底）：直接放入并结束，避免死循环
+            cur.append(line, i, n);
+            i += n;
+            continue;
+        }
+        cur.append(line, i, n);
+        w += cw;
+        i += n;
+    }
+    out.push_back(cur);   // 空行也推入一行，fit 会 padding 为空格
     return out;
 }
 
@@ -150,10 +233,10 @@ std::string frame(const Frame& f) {
     s += std::string(static_cast<std::size_t>(cols > used ? cols - used : 0), ' ');
     s += "\x1b[K\n";
 
-    // ---- 第二行：F6 / F7 / F8 / DEL / F10（蓝色背景） ----
+    // ---- 第二行：F6 / F7 / F8 / DEL / F10（蓝色背景，方括号样式与顶栏槽位一致） ----
     s += "\x1b[44;37m";
-    std::string bar = f.game_mode ? "F6 切换发送游戏命令/程序命令" : "F6 切换发送程序命令/游戏命令";
-    bar += "    F7 新增标签    F8 触发器    DEL 删除标签    F10 退出";
+    std::string bar = "[" + std::string(f.game_mode ? "F6 切换发送游戏命令/程序命令" : "F6 切换发送程序命令/游戏命令") + "]";
+    bar += std::string("    [F7 新增标签]    [F8 触发器]    [DEL 删除标签]    [F10 退出]");
     s += fit(bar, static_cast<std::size_t>(cols), false);  // 超出 cols 时截断，绝不回绕
     s += std::string("\x1b[K") + RST + "\n";
 
@@ -196,44 +279,125 @@ std::string frame(const Frame& f) {
         if (chat_h < 1 && log_h >= 2) chat_h = 1;   // 至少 1 行聊天区
         int text_h = log_h - chat_h;
         // 聊天区滚动用 chat_scroll_offset（Shift+↑↓），文本区滚动用 scroll_offset（↑↓）
-        std::size_t c_avail = f.chats.size() > static_cast<std::size_t>(chat_h)
-                              ? f.chats.size() - static_cast<std::size_t>(chat_h) : 0;
-        bool sep = chat_h > 0 && text_h > 0;   // 分隔行占用 1 行文本区
-        std::size_t tvis = static_cast<std::size_t>(text_h) - (sep ? 1u : 0u);
-        std::size_t t_avail = f.logs.size() > tvis
-                              ? f.logs.size() - tvis : 0;
+        bool sep = chat_h > 0 && text_h > 0;   // 聊天/日志分区间的横线行（占左列 1 行；右列网络包列贯通）
+
+        // 右侧"网络包"栏：占右侧 2/5，在聊天/文本区右侧以一列 | 分隔，铺满输出区高度。
+        // 内容为此前不显示的原始网络包：已美观化为多行 JSON，再按栏宽折行；[上翻 / ]下翻滚动。
+        int pktW = cols * 2 / 5;
+        int leftW = cols - 3 - pktW;   // 1 左边框 + 左列(3/5) + 1 分隔 | + 网络包列(2/5) + 1 右边框
+        if (leftW < 12) {              // 窄终端：左列至少保留 12 列，网络包列让位
+            pktW = cols - 3 - 12;
+            if (pktW < 8) pktW = 8;
+            leftW = cols - 3 - pktW;
+            if (leftW < 1) leftW = 1;
+        }
+        // 展开为显示行：每包的每行 JSON 按 pktW 折行；包与包之间插一空行分隔
+        std::vector<std::string> pk_rows;
+        for (const std::string& pkt : f.pkt_logs) {
+            std::size_t a = 0, m = pkt.size();
+            while (a <= m) {
+                std::size_t b = pkt.find('\n', a);
+                if (b == std::string::npos) b = m;
+                for (const std::string& seg : wrap_utf8(pkt.substr(a, b - a), pktW))
+                    pk_rows.push_back(seg);
+                if (b == m) break;
+                a = b + 1;
+            }
+            pk_rows.push_back("");   // 包间空行
+        }
+        if (!pk_rows.empty() && pk_rows.back().empty()) pk_rows.pop_back();  // 末尾不留空行
+        std::size_t pkt_total = pk_rows.size();
+        int pkt_vis = log_h > 0 ? log_h - 1 : 0;   // 网络包列内容行数（首行让给"网络包"标题行）
+        if (pkt_vis < 0) pkt_vis = 0;
+        std::size_t shown = pkt_total < static_cast<std::size_t>(pkt_vis)
+                            ? pkt_total : static_cast<std::size_t>(pkt_vis);
+        std::size_t gap = static_cast<std::size_t>(pkt_vis) - shown;   // 内容不足时顶部留白
+        int pmax = pkt_total > static_cast<std::size_t>(pkt_vis)
+                   ? static_cast<int>(pkt_total) - pkt_vis : 0;
+        int poff = f.pkt_scroll_offset < 0 ? 0 : f.pkt_scroll_offset;
+        if (poff > pmax) poff = pmax;
+        std::size_t windowTop = pkt_total >= shown + static_cast<std::size_t>(poff)
+                                ? pkt_total - shown - static_cast<std::size_t>(poff) : 0;
+        // 版块标题徽标：绿底黑字，独占一栏首行（正文从下一行开始，不再与标题挤在同一行）
+        const std::string B_CHAT = "\x1b[42;30m聊天\x1b[0m";
+        const std::string B_LOG  = "\x1b[42;30m日志\x1b[0m";
+        const std::string B_PKT  = "\x1b[42;30m网络包\x1b[0m";
+        // 标题行：徽标 + 剩余空白补满栏宽（独占一行）
+        auto chip_line = [&](const std::string& chip, int width) {
+            std::size_t chipw = display_width(chip);
+            int remain = width - static_cast<int>(chipw);
+            if (remain < 0) remain = 0;
+            return chip + std::string(static_cast<std::size_t>(remain), ' ');
+        };
+        // 网络包列第 n 条内容行（n=0,1,…，首行已让给标题）；内容不足时前 gap 行留白
+        auto pkt_text_at = [&](int n) -> std::string {
+            if (n < 0 || n >= static_cast<int>(pkt_vis)) return "";
+            if (n < static_cast<int>(gap)) return "";
+            std::size_t idx = windowTop + static_cast<std::size_t>(n - static_cast<int>(gap));
+            if (idx < pk_rows.size()) return pk_rows[idx];
+            return "";
+        };
+        int log_top = chat_h + (sep ? 1 : 0);   // 日志区顶行（日志标题所在行）
+        int chat_content_h = chat_h - 1;        // 聊天正文行数（首行让给标题）
+        if (chat_content_h < 0) chat_content_h = 0;
+        int log_content_h = log_h - log_top - 1;   // 日志正文行数（首行让给标题）
+        if (log_content_h < 0) log_content_h = 0;
+        // 单行输出：左列内容(left_style 染色) + 分隔 | + 网络包列（首行独立标题，其后为内容）+ 右边框
+        auto emit_row = [&](const std::string& left_content, const std::string& left_style, int row_idx) {
+            s += BORDER;
+            if (left_style.empty())
+                s += fit(left_content, static_cast<std::size_t>(leftW), false);
+            else
+                s += left_style + fit(left_content, static_cast<std::size_t>(leftW), false) + RST;
+            s += BORDER;   // 网络包列与左列之间的分隔 |
+            if (row_idx == 0)   // 网络包列首行：独立标题行（不接续正文）
+                s += chip_line(B_PKT, pktW);
+            else
+                s += fit(pkt_text_at(row_idx - 1), static_cast<std::size_t>(pktW), false);
+            s += BORDER + "\x1b[K\n";
+        };
+
+        int i = 0;
+        // ---- 聊天区：首行标题，其后为聊天消息（Shift+↑↓ 滚动） ----
+        std::size_t c_avail = f.chats.size() > static_cast<std::size_t>(chat_content_h)
+                              ? f.chats.size() - static_cast<std::size_t>(chat_content_h) : 0;
         int coff = f.chat_scroll_offset < 0 ? 0 : f.chat_scroll_offset;
         if (static_cast<std::size_t>(coff) > c_avail) coff = static_cast<int>(c_avail);
-        std::size_t c_start = f.chats.size() >= static_cast<std::size_t>(chat_h) + static_cast<std::size_t>(coff)
-                              ? f.chats.size() - static_cast<std::size_t>(chat_h) - static_cast<std::size_t>(coff) : 0;
+        std::size_t c_start = f.chats.size() >= static_cast<std::size_t>(chat_content_h) + static_cast<std::size_t>(coff)
+                              ? f.chats.size() - static_cast<std::size_t>(chat_content_h) - static_cast<std::size_t>(coff) : 0;
+        for (; i < chat_h; ++i) {
+            if (i == 0) {   // 聊天区标题行（独占一行，正文自下一行起）
+                emit_row(chip_line(B_CHAT, leftW), "", i);
+                continue;
+            }
+            std::size_t cm = c_start + static_cast<std::size_t>(i - 1);
+            if (cm < f.chats.size())
+                emit_row(f.chats[cm], "\x1b[33m", i);   // 聊天区黄色
+            else
+                emit_row(std::string(static_cast<std::size_t>(leftW), ' '), "", i);
+        }
+        // 聊天/日志分区之间用一排绿色等号分隔（仅左列；右侧网络包列继续）
+        if (sep) {
+            emit_row(std::string(static_cast<std::size_t>(leftW), '='), "\x1b[32m", i);
+            ++i;
+        }
+        // ---- 日志区：首行标题，其后为日志正文（↑↓ 滚动） ----
+        std::size_t tvis = static_cast<std::size_t>(log_content_h);
+        std::size_t t_avail = f.logs.size() > tvis ? f.logs.size() - tvis : 0;
         int off2 = f.scroll_offset < 0 ? 0 : f.scroll_offset;
         if (static_cast<std::size_t>(off2) > t_avail) off2 = static_cast<int>(t_avail);
         std::size_t t_start = f.logs.size() > tvis + static_cast<std::size_t>(off2)
                               ? f.logs.size() - tvis - static_cast<std::size_t>(off2) : 0;
-        int i = 0;
-        for (; i < chat_h; ++i) {
-            s += BORDER;
-            if (c_start + static_cast<std::size_t>(i) < f.chats.size())
-                s += "\x1b[33m" + fit(f.chats[c_start + static_cast<std::size_t>(i)],
-                                      static_cast<std::size_t>(cols - 2), false) + RST;  // 聊天区黄色
-            else
-                s += std::string(static_cast<std::size_t>(cols - 2), ' ');
-            s += BORDER + "\x1b[K\n";
-        }
-        // 聊天/文本分区之间用一排绿色等号分隔
-        if (sep) {
-            s += "\x1b[32m|" + fit(std::string(static_cast<std::size_t>(cols - 2), '='),
-                                   static_cast<std::size_t>(cols - 2), false) + "|\x1b[0m\x1b[K\n";
-            ++i;
-        }
         for (; i < log_h; ++i) {
-            s += BORDER;
-            std::size_t li = static_cast<std::size_t>(i) - static_cast<std::size_t>(chat_h) - (sep ? 1u : 0u) + t_start;
-            if (li < f.logs.size())
-                s += fit(f.logs[li], static_cast<std::size_t>(cols - 2), false);
+            if (i == log_top) {   // 日志区标题行（独占一行，正文自下一行起）
+                emit_row(chip_line(B_LOG, leftW), "", i);
+                continue;
+            }
+            std::size_t idx = t_start + static_cast<std::size_t>(i - log_top - 1);
+            if (idx < f.logs.size())
+                emit_row(f.logs[idx], "", i);
             else
-                s += std::string(static_cast<std::size_t>(cols - 2), ' ');
-            s += BORDER + "\x1b[K\n";
+                emit_row(std::string(static_cast<std::size_t>(leftW), ' '), "", i);
         }
     }
 

@@ -275,5 +275,70 @@ std::string dump(const Value& value) {
     return dump_impl(value);
 }
 
+namespace {
+
+std::string indent_str(int depth) {
+    std::string s;
+    for (int i = 0; i < depth; ++i) s += "  ";
+    return s;
+}
+
+void dump_pretty_impl(const Value& value, int depth, std::string& out) {
+    switch (value.v.index()) {
+        case 0: out += "null"; break;
+        case 1: out += std::get<bool>(value.v) ? "true" : "false"; break;
+        case 2: {
+            double d = std::get<double>(value.v);
+            if (std::isfinite(d)) {
+                if (d == static_cast<double>(static_cast<long long>(d)))
+                    out += std::to_string(static_cast<long long>(d));
+                else
+                    out += std::to_string(d);
+            } else {
+                out += "null";
+            }
+            break;
+        }
+        case 3: out += dump_string(std::get<std::string>(value.v)); break;
+        case 4: {
+            const auto& arr = std::get<Value::Array>(value.v);
+            out += "[";
+            for (std::size_t i = 0; i < arr.size(); ++i) {
+                if (i) out += ",";
+                out += "\n" + indent_str(depth + 1);
+                dump_pretty_impl(arr[i], depth + 1, out);
+            }
+            if (!arr.empty()) out += "\n" + indent_str(depth);
+            out += "]";
+            break;
+        }
+        default: {
+            const auto& obj = std::get<Value::Object>(value.v);
+            out += "{";
+            bool first = true;
+            for (const auto& [k, v] : obj) {
+                if (!first) out += ",";
+                first = false;
+                out += "\n" + indent_str(depth + 1);
+                out += dump_string(k);
+                out += ": ";
+                dump_pretty_impl(v, depth + 1, out);
+            }
+            if (!obj.empty()) out += "\n" + indent_str(depth);
+            out += "}";
+            break;
+        }
+    }
+}
+
+}  // namespace
+
+std::string dump_pretty(const Value& value) {
+    std::string out;
+    dump_pretty_impl(value, 0, out);
+    out += "\n";
+    return out;
+}
+
 }  // namespace json
 }  // namespace wsmud

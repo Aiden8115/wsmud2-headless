@@ -11,6 +11,7 @@
 #include "net.hpp"
 #include "ws.hpp"
 #include "trigger.hpp"
+#include "color.hpp"
 
 namespace wsmud {
 namespace mud {
@@ -40,6 +41,8 @@ struct Role {
 using LogFn = void (*)(int index, const std::string& line);
 // 聊天消息回调（与文本日志分流：聊天区/文本区分开显示）
 using ChatFn = void (*)(int index, const std::string& line);
+// 网络包回调（右侧"网络包"栏：显示未显示在聊天区/文本区的其余原始包）
+using PacketFn = void (*)(int index, const std::string& line);
 
 class Account {
 public:
@@ -117,20 +120,34 @@ public:
     std::string trigger_state_json();
     void update_idle(int64_t now);
 
+    // 触发器按玩家隔离：注入全局配置并同步到本账号引擎。
+    // 引擎只执行"该玩家私有(owner==my_name)"与"全局共享(owner 空)"的触发器；
+    // 空串 owner 的全局触发器对所有玩家生效，但不进入某玩家的 F8 编辑列表。
+    void set_triggers_all(const std::vector<trigger::Trigger>& all);
+    void sync_triggers();
+
     void set_log(LogFn fn) { log_ = fn; }
     void set_chat(ChatFn fn) { chat_ = fn; }
+    void set_packet(PacketFn fn) { packet_ = fn; }
 
 private:
     LogFn log_ = nullptr;
     ChatFn chat_ = nullptr;
+    PacketFn packet_ = nullptr;
+    std::vector<trigger::Trigger> all_triggers_;   // 注入的全局触发器全集（未过滤），sync_triggers 用它按玩家过滤
 
-    void log(const std::string& line) { if (log_) log_(index, line); }
-    void log_chat(const std::string& line) { if (chat_) chat_(index, line); }
+    // 统一出口：把服务器下发的 HTML 颜色标记转成 ANSI，再交给显示回调。
+    // 触发器用到的 on_text/on_chat 走原始串，不受此处影响。
+    void log(const std::string& line) { if (log_) log_(index, html_to_ansi(line)); }
+    void log_chat(const std::string& line) { if (chat_) chat_(index, html_to_ansi(line)); }
+    // 网络包栏：显示"不显示在聊天区/文本区"的其余原始包。原始串原样给出（不做 HTML→ANSI，
+    // 供右栏 JSON 美化/折行，避免颜色码干扰宽度计算）
+    void log_pkt(const std::string& line) { if (packet_) packet_(index, line); }
     void set_stage(Stage s, int64_t now, int64_t timeout_ms);
     void enter_disconnected(const std::string& reason);
     void on_ws_open(int64_t now);
     void on_message(const std::string& text);
-    void on_json(const json::Value& v);
+    void on_json(const json::Value& v, const std::string& raw);
 
     // 触发器脚本宿主回调（ud = Account*）
     static void trig_log_fn(void* ud, const std::string& line);

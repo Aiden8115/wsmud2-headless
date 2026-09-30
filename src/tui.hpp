@@ -35,6 +35,8 @@ struct Frame {
     bool game_mode = false;      // F6：false=程序命令 true=游戏命令
     std::vector<std::string> logs;  // 输出区日志（文本区，自动取末尾可见行）
     std::vector<std::string> chats;  // 聊天区消息（输出区上 1/3，自动取末尾可见行）
+    std::vector<std::string> pkt_logs;  // 右侧"网络包"栏原始包（每元素一包，多行；渲染时按栏宽折行并与聊天/文本区以一列 | 分隔）
+    int pkt_scroll_offset = 0;         // 网络包栏向上滚动行数（[上翻 / ]下翻）
     std::string cmd_prompt;      // "命令" / "游戏命令" / "账号n" / "密码n"
     std::string cmd_text;        // 当前输入（密码模式下会显示为 *）
     bool mask_input = false;     // 密码回显掩码
@@ -53,6 +55,8 @@ std::string frame(const Frame& f);
 
 // 按显示宽度截断 UTF-8 字符串（不切断字符），并填充空格到指定宽度
 std::string fit(const std::string& s, std::size_t width, bool pad_left = false);
+// 计算字符串的显示宽度（CJK 宽字符算 2 列，不截断、不做填充）
+std::size_t display_width(const std::string& s);
 
 }  // namespace tui
 }  // namespace wsmud

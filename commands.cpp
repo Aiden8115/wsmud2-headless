@@ -3,6 +3,7 @@
 #include <cstdio>      // fopen/fwrite/fclose
 #include <cstdlib>     // strtol
 #include <string>
+#include <utility>     // std::move
 #include <vector>
 
 #include "app.hpp"
@@ -22,6 +23,27 @@ std::string exe_dir() {
     return slash == std::string::npos ? "." : p.substr(0, slash);
 }
 
+// 原子写：先写同目录临时文件，flush + fsync 落盘后 rename 原位覆盖。
+// rename 为原子操作，写盘中途崩溃也只会留下可删除的临时文件，绝不损坏原配置。
+bool write_atomic(const std::string& path, const std::string& content, std::string& err) {
+    std::string tmp = path + ".tmp";
+    FILE* fp = std::fopen(tmp.c_str(), "wb");
+    if (!fp) { err = "无法写入 " + tmp; return false; }
+    bool ok = std::fwrite(content.data(), 1, content.size(), fp) == content.size();
+    if (ok && std::fflush(fp) == 0) {
+        if (::fsync(fileno(fp)) != 0) { ok = false; err = "fsync 失败"; }
+    } else {
+        ok = false;
+        if (err.empty()) err = "写入失败";
+    }
+    std::fclose(fp);
+    if (!ok) { std::remove(tmp.c_str()); return false; }
+    if (std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+    err = "重命名覆盖失败";
+    std::remove(tmp.c_str());
+    return false;
+}
+
 void cmd_status() {
     for (auto& a : accounts) {
         const char* st = stage_name(a.stage);
@@ -38,7 +60,7 @@ void cmd_status() {
 
 void cmd_help() {
     out("程序命令：status / reconnect [N|all] / send <N> <命令> / reloadTrigger / quit（退出当前槽位账号）/ help");
-    out("触发器：trigger list 查看（编辑 trigger.json 后输入 reloadTrigger 重载）");
+    out("触发器：trigger list 查看；F8 列表内 a/e/空格/d 可直接增删改并原子写回 trigger.json，也可改文件后 reloadTrigger 重载");
     out("按键：F1-F5 选中槽位 | ←→ 切换标签页 | ↑↓ 滚动日志 | F6 切换命令/游戏命令 | "
         "F7 新增标签页 | F8 触发器列表 | DEL 删除当前标签页（仅序号>5） | F10 退出程序");
 }
@@ -145,8 +167,33 @@ void reload_triggers() {
         return;
     }
     g_trig_cfg = list;
-    for (auto& a : accounts) a.trig.replace(list);
+    for (auto& a : accounts) a.set_triggers_all(list);
     out("已重载 " + std::to_string(list.size()) + " 个触发器（trigger.json）");
+}
+
+// 把内存配置原子写回 trigger.json，并同步到所有账号引擎。
+// 关键保障：先 dump 再 load_from_file 往返校验（同一套规则），dump 有 bug 也在写盘前暴露；
+// 写盘只用原子写，失败时内存配置与磁盘旧文件均不被破坏。
+void persist_triggers() {
+    std::string path = exe_dir() + "/trigger.json";
+    std::string text = wsmud::trigger::Engine::dump_triggers(g_trig_cfg);
+    // 往返校验：写出的文本必须能被 load_from_file 原样读回
+    std::string tmp = path + ".verify";
+    FILE* fw = std::fopen(tmp.c_str(), "wb");
+    std::vector<wsmud::trigger::Trigger> check;
+    std::string err;
+    bool ok = false;
+    if (fw) {
+        std::fwrite(text.data(), 1, text.size(), fw);
+        std::fclose(fw);
+        ok = wsmud::trigger::Engine::load_from_file(tmp, check, err);
+        std::remove(tmp.c_str());
+    }
+    if (!ok) { out("[保存失败] " + (err.empty() ? "校验读回异常" : err) + "（未写盘，内存配置保留）"); return; }
+    if (!write_atomic(path, text, err)) { out("[保存失败] " + err + "（未写盘，内存配置保留）"); return; }
+    g_trig_cfg = std::move(check);   // 以读回的规范化配置作为唯一真相
+    for (auto& a : accounts) a.set_triggers_all(g_trig_cfg);
+    out("已保存 " + std::to_string(g_trig_cfg.size()) + " 个触发器（trigger.json）");
 }
 
 // 处理程序命令（一行）
@@ -165,6 +212,7 @@ void process_line(const std::string& raw) {
         a.disconnect();
         acc_logs[static_cast<std::size_t>(a.index - 1)].clear();  // 槽位重置时清空该标签页输出区
         acc_chat_logs[static_cast<std::size_t>(a.index - 1)].clear();  // 同步清空聊天区
+        acc_pkt_logs[static_cast<std::size_t>(a.index - 1)].clear();   // 同步清空网络包栏
         // 清空凭据与状态，让该槽位循环回到录入阶段（start_login 会自行重置 servers/roles）
         a.account.clear();
         a.password.clear();
