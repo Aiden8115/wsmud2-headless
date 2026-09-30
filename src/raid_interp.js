@@ -574,8 +574,10 @@ function sysCmd(flow, text) {
     cmd = resolvePlaceholders(cmd).trim();
     if (!cmd) return;
     var now = __cxx.now();
-    var at = flow.lastCmdMs + flow.cmdDelay;
-    if (at <= now) at = now + flow.cmdDelay;
+    // 命令最早在 now 发出，且距上次发送至少 cmdDelay；首条 lastCmdMs=-999999
+    // 使 lastCmdMs+cmdDelay<<now → 立即发送（修复旧逻辑“只要够久就再加 cmdDelay”，
+    // 否则首条/等待良久后的每条命令都会被强制拖后 cmdDelay，脚本逐条显得很慢）
+    var at = Math.max(now, flow.lastCmdMs + flow.cmdDelay);
     for (var k = 0; k < rep; k++) flow.sendQueue.push({ cmd: cmd, at: at + k * flow.cmdDelay });
     flow.wait = { t: 'sendQueue' };
 }
