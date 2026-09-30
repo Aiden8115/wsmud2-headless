@@ -1,11 +1,15 @@
 // thpool.hpp — 共享触发器 worker 线程池：多条账号复用固定数量的后台线程。
 // 早期实现是"每账号一条 std::thread"：账号多了会为每个登录角色各占一个 CPU 核心，
 // 线程数随账号数无限增长，对小主机负担过大。
-// 现改为全局有界线程池：
-//   - 线程总数封顶（默认 min(硬件并发, 8)，可用环境变量 WSMUD_WORKERS 覆盖）；
+// 现改为收敛为 2 条线程的模型：
+//   - 主线程（1 条）：专职"非触发器"——网络收发、协议解析、UI 渲染、状态、账号管理；
+//   - 触发器 worker（默认 1 条）：全部账号的触发器脚本串行执行。重脚本只在后台 worker
+//     上跑，不冻结主线程事件循环；
+// 即程序线程总数恒为 2（除非用 WSMUD_WORKERS 显式调大触发 worker 的并行度）。
+// 其余性质：
 //   - 空闲 worker 阻塞在条件变量上，不占 CPU 核心，只在真正执行脚本时才用核；
-//   - 账号数可任意多：超出线程数时多个账号复用同一条 worker（顺序执行，退化为
-//     后台单线程串行，仍不冻结 UI 事件循环）；
+//   - 账号数可任意多，超出线程数时多个账号复用同一条 worker（顺序执行，仍是后台
+//     单线程，不冻结 UI 事件循环）；
 //   - QuickJS runtime 始终在账号绑定的同一条 worker 上创建与释放（线程亲和），
 //     账号只要保持绑定不换 worker 即安全。
 #pragma once
@@ -66,11 +70,9 @@ inline WorkerPool& WorkerPool::instance() {
 
 inline void WorkerPool::ensure_started() {
     std::call_once(start_flag_, [this] {
-        // 线程数：默认取硬件并发上限 8，可用 WSMUD_WORKERS 覆盖（>=1）
-        unsigned h = std::thread::hardware_concurrency();
-        int def = h == 0 ? 2 : static_cast<int>(h);
-        if (def > 8) def = 8;
-        int n = def;
+        // 默认仅 1 条触发器 worker（与主线程合起来共 2 条线程）。
+        // 如需多个触发器并行，可用 WSMUD_WORKERS 增大（>=1）。
+        int n = 1;
         if (const char* env = std::getenv("WSMUD_WORKERS")) {
             int e = std::atoi(env);
             if (e >= 1) n = e;
