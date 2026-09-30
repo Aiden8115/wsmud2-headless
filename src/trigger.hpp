@@ -55,6 +55,12 @@ public:
     // 角色 id：Buff 事件"触发对象"（data.id == 自己）判断
     void set_role_id(const std::string& id) { role_id_ = id; }
 
+    // JS 运行时懒初始化/释放：QuickJS 运行时须在同一个线程上创建与销毁。
+    // ensure_js() 由 js_start/js_tick/js_feed 等首次使用时在调用方线程创建运行时；
+    // release() 由持有线程（worker）在线程退出前释放运行时（幂等）。
+    void ensure_js();
+    void release();
+
     // 持久化：程序只读不写——触发器统一由软件同级目录 trigger.json 维护。
     // 旧接口保留（save 为 no-op，避免脚本 @setTrigger → host_set_trigger → save 写盘）
     void set_save_path(const std::string& path) { save_path_ = path; }
