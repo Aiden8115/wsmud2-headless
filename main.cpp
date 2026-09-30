@@ -321,6 +321,7 @@ void classic_run_loop() {
         }
 
         for (auto& a : accounts) a->tick(now);
+        for (auto& a : accounts) a->drain_trig_main();   // 排空 worker 回传的 send/log 闭包
         for (auto& a : accounts) {
             if (a->http.conn().fd >= 0) a->http.conn().flush();
             if (a->ws.conn().fd >= 0) a->ws.conn().flush();

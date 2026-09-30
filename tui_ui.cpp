@@ -958,6 +958,7 @@ void tui_run_loop() {
         if (quitting) break;
 
         for (auto& a : accounts) a->tick(now);
+        for (auto& a : accounts) a->drain_trig_main();   // 排空 worker 回传的 send/log 闭包
         // 登录失败（如密码错误）：自动回退到该槽位的账号/密码录入阶段，避免卡死
         for (auto& a : accounts) {
             if (a->stage == Account::Stage::Disconnected &&

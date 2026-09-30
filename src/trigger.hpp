@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -74,8 +75,8 @@ public:
     // 用新配置整体替换本引擎触发器（不落盘）
     void replace(const std::vector<Trigger>& ts);
 
-    const std::vector<Trigger>& list() const { return triggers_; }
-    std::size_t count() const { return triggers_.size(); }
+    std::vector<Trigger> list() const;
+    std::size_t count() const { return list().size(); }
 
     // 导入分享码（云端返回的触发器 JSON 字符串，即 importTrigger 中 JSON.parse(data) 的输入）
     bool import(const std::string& data_json, std::string& err);
@@ -158,6 +159,7 @@ private:
     static int js_interrupt_handler(JSRuntime* rt, void* opaque);   // 防死循环（单次调用上限）
 
     std::vector<Trigger> triggers_;
+    mutable std::mutex list_mu_;       // 保护 triggers_：worker 的 fire/fire 链与主线程的 list() 并发安全
     std::string save_path_;
     std::string role_id_;
 

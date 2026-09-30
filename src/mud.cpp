@@ -48,6 +48,7 @@ void Account::enter_disconnected(const std::string& reason) {
     http.close();
     last_error = reason;
     set_stage(Stage::Disconnected, now_ms(), 0);
+    stop_trig_worker();   // 退出 worker 并释放 QuickJS 运行时（断线/失败后触发器停止）
     log("[断开] " + reason + "（输入 reconnect " + std::to_string(index) + " 重连）");
 }
 
@@ -207,7 +208,8 @@ void Account::tick(int64_t now) {
             }
             for (auto& m : msgs) on_message(m);
             update_idle(now);
-            trig.tick(now);   // 触发器引擎：技能冷却结束/时辰已到/流程推进
+            // 触发器心跳：合并——队列里已有待执行 tick 则跳过本帧，避免重脚本时积压
+            if (trig_q_.empty()) enqueue_trig([this, now] { trig.tick(now); });
             if (now - last_ping_ms >= PING_INTERVAL_MS) {
                 ws.send_ping();
                 last_ping_ms = now;
@@ -303,16 +305,20 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
     if (stage == Stage::Online) {
         if (type == "text") {
             const std::string msg = v.get("msg").as_string();
-            trig.on_text(msg);
-            // 文本启发 → 脱离战斗（与扩展 raid-role 一致）
+            // 文本启发 → 脱离战斗（与扩展 raid-role 一致）— 主线程先改状态，快照随事件下发
             if (msg.find("只能在战斗中使用") != std::string::npos ||
                 msg.find("这里不允许战斗") != std::string::npos ||
                 msg.find("没时间这么做") != std::string::npos) {
-                if (my_combat) { my_combat = false; update_idle(now_ms()); }
+                my_combat = false; update_idle(now_ms());
             }
+            publish_state();
+            enqueue_trig([this, msg] { trig.on_text(msg); });
         } else if (type == "msg") {
-            trig.on_chat(v.get("ch").as_string(), v.get("name").as_string(),
-                         v.get("uid").as_string(), v.get("content").as_string());
+            const std::string ch = v.get("ch").as_string(), name = v.get("name").as_string();
+            const std::string uid = v.get("uid").as_string(), content = v.get("content").as_string();
+            enqueue_trig([this, ch, name, uid, content] {
+                trig.on_chat(ch, name, uid, content);
+            });
         } else if (type == "status") {
             trig_on_status(v);
         } else if (type == "combat") {
@@ -320,20 +326,26 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
             const auto& end = v.get("end");
             if (!start.is_null() && start.as_int() == 1) {
                 my_combat = true; update_idle(now_ms());
-                trig.on_combat_enter();
+                publish_state();
+                enqueue_trig([this] { trig.on_combat_enter(); });
             } else if (!end.is_null() && end.as_int() == 1) {
                 my_combat = false; update_idle(now_ms());
-                trig.on_combat_leave();
+                publish_state();
+                enqueue_trig([this] { trig.on_combat_leave(); });
             }
         } else if (type == "die") {
             const auto& relive = v.get("relive");
             bool revived = !relive.is_null() && (!relive.is_bool() || relive.as_bool());
             my_living = revived;
             update_idle(now_ms());
-            trig.on_die(revived ? "已经复活" : "已经死亡");
+            publish_state();
+            const std::string wdy = revived ? "已经复活" : "已经死亡";
+            enqueue_trig([this, wdy] { trig.on_die(wdy); });
         } else if (type == "dispfm") {
-            trig.on_dispfm(v.get("id").as_string(), v.get("rtime").as_string(),
-                           v.get("distime").as_string(), now_ms());
+            enqueue_trig([this, v] {
+                trig.on_dispfm(v.get("id").as_string(), v.get("rtime").as_string(),
+                               v.get("distime").as_string(), now_ms());
+            });
         } else if (type == "sc") {
             trig_on_sc(v);
         } else if (type == "items") {
@@ -341,13 +353,15 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
         } else if (type == "itemadd") {
             trig_on_itemadd(v);
         } else if (type == "itemremove") {
-            trig.on_itemremove(v.get("id").as_string());
+            const std::string id = v.get("id").as_string();
+            enqueue_trig([this, id] { trig.on_itemremove(id); });
         } else if (type == "state") {
             my_state_text = state_word(v.get("state").as_string());
             update_idle(now_ms());
         } else if (type == "room") {
             my_room_name = v.get("name").as_string();
-            trig.on_room_clear();
+            publish_state();
+            enqueue_trig([this] { trig.on_room_clear(); });
         }
     }
 
@@ -415,6 +429,7 @@ void Account::disconnect() {
     http.close();
     set_stage(Stage::Disconnected, now_ms(), 0);
     last_error = "用户主动断开";
+    stop_trig_worker();   // 主动断开/quit 同样停止 worker
     log("[断开] 用户主动断开");
 }
 
@@ -439,6 +454,8 @@ void Account::init_triggers() {
     my_idle_start_ms = 0;
     my_status.clear();
     sync_triggers();   // 玩家名已确定，按 owner 过滤加载该玩家的触发器
+    publish_state();   // 初始化快照，worker 首次读取即有完整状态
+    start_trig_worker();   // 进游戏即拉起触发器 worker（此后 trig 事件/心跳全部走 worker 队列）
     log("[触发] 触发器引擎就绪");
 }
 
@@ -473,7 +490,9 @@ std::string Account::state_word(const std::string& raw) {
     return "发呆";
 }
 
-std::string Account::trigger_state_json() {
+// 主线程：把 my_*（仅主线程读写）封装成 JSON 快照缓存到 state_j_。
+// worker 只读这份带锁快照，不直接触碰任何 my_* 字段，从而把跨线程共享面收敛为一个 string + mutex。
+void Account::publish_state() {
     int64_t idle_time = 0;
     if (my_idle_start_ms > 0) idle_time = (now_ms() - my_idle_start_ms) / 1000;
     bool free = my_status.find("busy") == my_status.end() &&
@@ -494,20 +513,63 @@ std::string Account::trigger_state_json() {
     s += ",\"level\":" + json::dump(json::Value(my_level));
     s += ",\"name\":" + json::dump(json::Value(my_name.empty() ? role.name : my_name));
     s += "}";
-    return s;
+    std::lock_guard<std::mutex> lk(st_jm_);
+    state_j_ = std::move(s);
+}
+std::string Account::get_state_json() {
+    std::lock_guard<std::mutex> lk(st_jm_);
+    return state_j_;
 }
 
+// ---------- 触发器 worker 线程 ----------
+
+void Account::worker_loop() {
+    for (;;) {
+        std::function<void()> fn;
+        if (!trig_q_.pop(fn)) break;   // stop() 且队列清空 → 退出
+        fn();
+    }
+}
+void Account::start_trig_worker() {
+    if (worker_started_) return;
+    worker_started_ = true;
+    trig_q_.reset();   // 复位 stop 位并清残留命令（可重复启动，如重连）
+    main_q_.reset();
+    trig_worker_ = std::thread(&Account::worker_loop, this);
+}
+void Account::stop_trig_worker() {
+    if (!worker_started_) return;
+    worker_started_ = false;
+    // 在 worker 线程释放 JS 运行时（QuickJS 线程亲和：创建与销毁须同线程），
+    // 该闭包执行完后队列空、stop 位置位 → worker pop 返回 false 退出。
+    trig_q_.push([this] { trig.release(); });
+    trig_q_.stop();
+    if (trig_worker_.joinable()) trig_worker_.join();
+}
+void Account::enqueue_trig(std::function<void()> fn) {
+    if (!worker_started_) return;
+    trig_q_.push(std::move(fn));
+}
+void Account::post_main(std::function<void()> fn) { main_q_.push(std::move(fn)); }
+void Account::drain_trig_main() {
+    std::function<void()> fn;
+    while (main_q_.try_pop(fn)) fn();
+}
+
+// 以下三个回调均在 worker 线程被 QuickJS 调用：
+// send/log 不能直接在 worker 线程触碰主线程专属的 ws/日志缓冲，改经反向队列回主线程执行；
+// state 读取主线程缓存的状态快照（互斥锁保护，无跨线程直接共享字段）。
 void Account::trig_log_fn(void* ud, const std::string& line) {
     Account* a = static_cast<Account*>(ud);
-    if (a) a->log("[触发] " + line);
+    if (a) a->post_main([a, line] { a->log("[触发] " + line); });
 }
 void Account::trig_send_fn(void* ud, const std::string& cmd) {
     Account* a = static_cast<Account*>(ud);
-    if (a) a->send_command(cmd);
+    if (a) a->post_main([a, cmd] { a->send_command(cmd); });
 }
 std::string Account::trig_state_fn(void* ud) {
     Account* a = static_cast<Account*>(ud);
-    return a ? a->trigger_state_json() : "{}";
+    return a ? a->get_state_json() : "{}";
 }
 
 void Account::trig_on_items(const json::Value& v) {
@@ -525,7 +587,7 @@ void Account::trig_on_items(const json::Value& v) {
         d.have_max_hp = !it.get("max_hp").is_null();
         d.have_max_mp = !it.get("max_mp").is_null();
         rids.push_back(d);
-        // 角色自身 hp/mp（扩展 _monitorHpMp：items 全量更新）
+        // 角色自身 hp/mp（扩展 _monitorHpMp：items 全量更新）— 主线程先行，快照随事件下发
         if (d.id == role.id) {
             my_hp = d.hp; my_max_hp = d.max_hp; my_mp = d.mp; my_max_mp = d.max_mp;
             const auto& st = it.get("status");
@@ -538,13 +600,13 @@ void Account::trig_on_items(const json::Value& v) {
             }
         }
     }
-    trig.on_items(rids);
+    publish_state();
+    enqueue_trig([this, rids] { trig.on_items(rids); });
 }
 
 void Account::trig_on_itemadd(const json::Value& v) {
     const std::string id = v.get("id").as_string();
     const std::string name = v.get("name").as_string();
-    trig.on_itemadd(id, name);
     if (id == role.id) {
         if (!v.get("hp").is_null()) my_hp = v.get("hp").as_number();
         if (!v.get("max_hp").is_null()) my_max_hp = v.get("max_hp").as_number();
@@ -559,18 +621,25 @@ void Account::trig_on_itemadd(const json::Value& v) {
             }
         }
     }
+    publish_state();
+    enqueue_trig([this, id, name] { trig.on_itemadd(id, name); });
 }
 
 void Account::trig_on_sc(const json::Value& v) {
     const std::string id = v.get("id").as_string();
-    trig.on_sc(id, val_str(v.get("hp")), val_str(v.get("mp")),
-               val_str(v.get("max_hp")), val_str(v.get("max_mp")), val_str(v.get("damage")));
+    const std::string hp = val_str(v.get("hp")), mp = val_str(v.get("mp"));
+    const std::string max_hp = val_str(v.get("max_hp")), max_mp = val_str(v.get("max_mp"));
+    const std::string damage = val_str(v.get("damage"));
     if (id == role.id) {   // 扩展 _monitorHpMp：sc 更新角色自身
         if (!v.get("hp").is_null()) my_hp = v.get("hp").as_number();
         if (!v.get("max_hp").is_null()) my_max_hp = v.get("max_hp").as_number();
         if (!v.get("mp").is_null()) my_mp = v.get("mp").as_number();
         if (!v.get("max_mp").is_null()) my_max_mp = v.get("max_mp").as_number();
     }
+    publish_state();
+    enqueue_trig([this, id, hp, mp, max_hp, max_mp, damage] {
+        trig.on_sc(id, hp, mp, max_hp, max_mp, damage);
+    });
 }
 
 void Account::trig_on_status(const json::Value& v) {
@@ -580,18 +649,25 @@ void Account::trig_on_status(const json::Value& v) {
     const std::string count = val_str(v.get("count"));
     const std::string duration = val_str(v.get("duration"));
     const auto& sid = v.get("sid");
+    // 主线程：先更新 buff 状态并收集要下发的 sid；随后统一 publish + 逐条入队
+    std::vector<std::string> sids;
     auto post = [&](const std::string& s) {
-        trig.on_status(id, s, action, name, count, duration);
         if (id == role.id) {   // 扩展 _monitorStatus：busy/faint/rash 跟踪
             if (action == "add") my_status.insert(s);
             else if (action == "remove") my_status.erase(s);
         }
+        sids.push_back(s);
     };
     if (sid.is_array()) {
         for (const auto& s : sid.as_array()) post(val_str(s));
     } else if (!sid.is_null()) {
         post(val_str(sid));
     }
+    publish_state();
+    for (auto& s : sids)
+        enqueue_trig([this, id, action, name, count, duration, s] {
+            trig.on_status(id, s, action, name, count, duration);
+        });
 }
 
 void Account::trig_on_pm(const json::Value& v) {
@@ -604,7 +680,9 @@ void Account::trig_on_pm(const json::Value& v) {
         std::string raw_name = arr.size() > 1 ? arr[1].as_string() : "";
         std::string price = arr.size() > 2 ? val_str(arr[2]) : "";
         std::string raw_time = arr.size() > 3 ? val_str(arr[3]) : "";
-        trig.on_auction(id, raw_name, price, raw_time);
+        enqueue_trig([this, id, raw_name, price, raw_time] {
+            trig.on_auction(id, raw_name, price, raw_time);
+        });
     }
 }
 
@@ -638,7 +716,9 @@ void Account::trig_on_events(const json::Value& v) {
             int64_t midnight = sec - (tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec);
             times = std::to_string(sec - midnight);
         }
-        trig.on_activity(type, aname, keyword, grade, times);
+        enqueue_trig([this, type, aname, keyword, grade, times] {
+            trig.on_activity(type, aname, keyword, grade, times);
+        });
     }
 }
 
@@ -649,14 +729,16 @@ void Account::trig_on_pack(const json::Value& v) {
     const auto& rcnt = v.get("count");
     if (rid.is_null() || rname.is_null() || rcnt.is_null()) return;
     if (!v.get("remove").is_null()) return;
-    trig.on_pack(val_str(rid), rname.as_string(), val_str(rcnt));
+    const std::string id = val_str(rid), name = rname.as_string(), cnt = val_str(rcnt);
+    enqueue_trig([this, id, name, cnt] { trig.on_pack(id, name, cnt); });
 }
 
 void Account::trig_on_social(const json::Value& v) {
     // 社交消息：dialog=message 且无 id/items（扩展 trigger-events-message.js）
     if (!v.get("id").is_null()) return;
     if (!v.get("items").is_null()) return;
-    trig.on_social(v.get("message").get("content").as_string());
+    const std::string content = v.get("message").get("content").as_string();
+    enqueue_trig([this, content] { trig.on_social(content); });
 }
 
 }  // namespace mud

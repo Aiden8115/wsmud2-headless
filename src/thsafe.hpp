@@ -34,6 +34,11 @@ public:
         q_.pop();
         return true;
     }
+    // 队列当前是否为空（仅用于主线程高频 tick 的合并判断；检查→入队间隙压入一条额外 tick 无害）
+    bool empty() {
+        std::lock_guard<std::mutex> lk(m_);
+        return q_.empty();
+    }
     void stop() {
         std::lock_guard<std::mutex> lk(m_);
         stop_ = true;

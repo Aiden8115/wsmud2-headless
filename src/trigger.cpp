@@ -481,9 +481,15 @@ static JSValue js_now(JSContext* ctx, JSValueConst, int, JSValueConst*) {
 // ---------- 构造 / 析构 / 移动 ----------
 
 Engine::Engine() {
-    js_init();
+    // 不再在构造时创建 QuickJS 运行时：运行时须与使用/销毁在同一条线程上。
+    // 运行时由 ensure_js() 在 worker 线程首次执行脚本时懒创建。
 }
-Engine::~Engine() {
+
+void Engine::ensure_js() {
+    if (!js_env_) js_init();
+}
+
+void Engine::release() {
     if (js_env_) {
         JsEnv* j = static_cast<JsEnv*>(js_env_);
         JS_FreeValue(j->ctx, j->fn_start);
@@ -494,6 +500,10 @@ Engine::~Engine() {
         delete j;
         js_env_ = nullptr;
     }
+}
+
+Engine::~Engine() {
+    release();
 }
 Engine::Engine(Engine&& o) noexcept
     : js_env_(o.js_env_), interrupt_count_(o.interrupt_count_),
@@ -587,6 +597,7 @@ static void js_call_void(JSContext* ctx, JSValueConst fn, int argc, JSValueConst
 }
 
 void Engine::js_start(const std::string& name, const std::string& source) {
+    ensure_js();
     if (!js_env_) return;
     JsEnv* j = static_cast<JsEnv*>(js_env_);
     interrupt_count_ = 0;
@@ -596,12 +607,14 @@ void Engine::js_start(const std::string& name, const std::string& source) {
     JS_FreeValue(j->ctx, args[1]);
 }
 void Engine::js_tick() {
+    ensure_js();
     if (!js_env_) return;
     JsEnv* j = static_cast<JsEnv*>(js_env_);
     interrupt_count_ = 0;
     js_call_void(j->ctx, j->fn_tick, 0, nullptr);
 }
 void Engine::js_feed(const std::string& text) {
+    ensure_js();
     if (!js_env_ || text.empty()) return;
     JsEnv* j = static_cast<JsEnv*>(js_env_);
     interrupt_count_ = 0;
@@ -615,7 +628,10 @@ void Engine::js_feed(const std::string& text) {
 // ============================================================
 
 void Engine::fire(const char* event, const Params& params) {
-    for (const auto& t : triggers_) {
+    // 快照当前触发器列表：worker 主线程可能在并发 replace()/编辑，锁定复制避免迭代期间被改写
+    std::vector<Trigger> snap;
+    { std::lock_guard<std::mutex> lk(list_mu_); snap = triggers_; }
+    for (const auto& t : snap) {
         if (!t.active) continue;
         if (t.event != event) continue;
         run_trigger(t, params);
@@ -1024,6 +1040,7 @@ int64_t Engine::host_now() { return mono_ms(); }
 // ============================================================
 
 bool Engine::import(const std::string& data_json, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     std::string perr;
     json::Value v = json::parse(data_json, &perr);
     if (!perr.empty() || !v.is_object()) { err = "分享码数据解析失败"; return false; }
@@ -1051,6 +1068,7 @@ bool Engine::import(const std::string& data_json, std::string& err) {
 }
 
 bool Engine::enable(std::size_t idx, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     if (idx < 1 || idx > triggers_.size()) { err = "触发器编号无效（1-" + num_str(triggers_.size()) + "）"; return false; }
     Trigger& t = triggers_[idx - 1];
     if (t.active) { err = "触发器已处于启用状态"; return false; }
@@ -1059,6 +1077,7 @@ bool Engine::enable(std::size_t idx, std::string& err) {
     return true;
 }
 bool Engine::disable(std::size_t idx, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     if (idx < 1 || idx > triggers_.size()) { err = "触发器编号无效（1-" + num_str(triggers_.size()) + "）"; return false; }
     Trigger& t = triggers_[idx - 1];
     if (!t.active) { err = "触发器已处于停用状态"; return false; }
@@ -1071,6 +1090,7 @@ bool Engine::disable(std::size_t idx, std::string& err) {
 bool Engine::update(std::size_t idx, const std::string& name, const std::string& event,
                     const std::vector<std::pair<std::string, std::string>>& conds,
                     const std::string& source, bool active, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     if (idx >= triggers_.size()) { err = "触发器编号无效"; return false; }
     if (!name_ok(name)) { err = "触发器的名称只能使用中文、英文和数字字符。"; return false; }
     for (std::size_t i = 0; i < triggers_.size(); ++i)
@@ -1093,6 +1113,7 @@ bool Engine::update(std::size_t idx, const std::string& name, const std::string&
 bool Engine::add(const std::string& name, const std::string& event,
                  const std::vector<std::pair<std::string, std::string>>& conds,
                  const std::string& source, bool active, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     if (!name_ok(name)) { err = "触发器的名称只能使用中文、英文和数字字符。"; return false; }
     for (const auto& t : triggers_)
         if (t.name == name) { err = "无法修改名称，已经存在同名触发器！"; return false; }
@@ -1111,6 +1132,7 @@ bool Engine::add(const std::string& name, const std::string& event,
 }
 
 bool Engine::remove(std::size_t idx, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     if (idx >= triggers_.size()) { err = "触发器编号无效"; return false; }
     triggers_.erase(triggers_.begin() + static_cast<std::ptrdiff_t>(idx));
     save();
@@ -1254,7 +1276,13 @@ bool Engine::load_from_file(const std::string& path, std::vector<Trigger>& out, 
 }
 
 void Engine::replace(const std::vector<Trigger>& ts) {
+    std::lock_guard<std::mutex> lk(list_mu_);
     triggers_ = ts;
+}
+
+std::vector<Trigger> Engine::list() const {
+    std::lock_guard<std::mutex> lk(list_mu_);
+    return triggers_;
 }
 
 // 把触发器列表序列化为 trigger.json 顶层文本。
