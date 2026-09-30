@@ -1,6 +1,8 @@
 #include "mud.hpp"
 
 #include <cstdio>
+#include <future>   // std::promise：stop_trig_worker 同步等待 release 闭包执行
+#include <memory>   // std::make_shared
 
 namespace wsmud {
 namespace mud {
@@ -208,8 +210,9 @@ void Account::tick(int64_t now) {
             }
             for (auto& m : msgs) on_message(m);
             update_idle(now);
-            // 触发器心跳：合并——队列里已有待执行 tick 则跳过本帧，避免重脚本时积压
-            if (trig_q_.empty()) enqueue_trig([this, now] { trig.tick(now); });
+            // 触发器心跳：合并——绑定 worker 队列里已有待执行 tick 则跳过本帧，避免重脚本时积压
+            if (WorkerPool::instance().qempty(worker_))
+                enqueue_trig([this, now] { trig.tick(now); });
             if (now - last_ping_ms >= PING_INTERVAL_MS) {
                 ws.send_ping();
                 last_ping_ms = now;
@@ -521,34 +524,29 @@ std::string Account::get_state_json() {
     return state_j_;
 }
 
-// ---------- 触发器 worker 线程 ----------
+// ---------- 触发器 worker（共享线程池，账号绑定其中一条） ----------
 
-void Account::worker_loop() {
-    for (;;) {
-        std::function<void()> fn;
-        if (!trig_q_.pop(fn)) break;   // stop() 且队列清空 → 退出
-        fn();
-    }
-}
 void Account::start_trig_worker() {
-    if (worker_started_) return;
-    worker_started_ = true;
-    trig_q_.reset();   // 复位 stop 位并清残留命令（可重复启动，如重连）
-    main_q_.reset();
-    trig_worker_ = std::thread(&Account::worker_loop, this);
+    if (worker_ >= 0) return;          // 已绑定（重连时复用），保持 QuickJS 线程亲和
+    main_q_.reset();                   // 清残留回传闭包
+    worker_ = WorkerPool::instance().acquire();
 }
 void Account::stop_trig_worker() {
-    if (!worker_started_) return;
-    worker_started_ = false;
-    // 在 worker 线程释放 JS 运行时（QuickJS 线程亲和：创建与销毁须同线程），
-    // 该闭包执行完后队列空、stop 位置位 → worker pop 返回 false 退出。
-    trig_q_.push([this] { trig.release(); });
-    trig_q_.stop();
-    if (trig_worker_.joinable()) trig_worker_.join();
+    if (worker_ < 0) return;
+    int w = worker_;
+    worker_ = -1;
+    // 释放 JS 运行时必须在账号绑定的同一条 worker 上执行（QuickJS 线程亲和）。
+    // 用 promise 同步等待 release 闭包跑完：队列 FIFO 保证该账号此前入队的所有事件
+    // 也在此前都已执行完，随后的对象销毁不会出现 worker 悬挂 this 的竞态。
+    auto done = std::make_shared<std::promise<void>>();
+    auto fut = done->get_future();
+    WorkerPool::instance().submit(w, [this, done] { trig.release(); done->set_value(); });
+    WorkerPool::instance().release(w);   // 归还绑定，供其他账号复用
+    fut.wait();
 }
 void Account::enqueue_trig(std::function<void()> fn) {
-    if (!worker_started_) return;
-    trig_q_.push(std::move(fn));
+    if (worker_ < 0) return;
+    WorkerPool::instance().submit(worker_, std::move(fn));
 }
 void Account::post_main(std::function<void()> fn) { main_q_.push(std::move(fn)); }
 void Account::drain_trig_main() {

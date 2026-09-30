@@ -399,5 +399,6 @@ int main() {
     }
 
     for (auto& a : accounts) a->disconnect();
+    WorkerPool::instance().shutdown();   // 停止并 join 共享触发器 worker 线程池
     return 0;
 }

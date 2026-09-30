@@ -16,6 +16,7 @@
 #include "trigger.hpp"
 #include "color.hpp"
 #include "thsafe.hpp"
+#include "thpool.hpp"
 
 namespace wsmud {
 namespace mud {
@@ -138,13 +139,15 @@ public:
     void set_chat(ChatFn fn) { chat_ = fn; }
     void set_packet(PacketFn fn) { packet_ = fn; }
 
-    // ---------- 触发器 worker 线程（每账号一条，独占 QuickJS 运行时） ----------
-    // 主线程把 trig.on_* / tick / replace 等通过闭包闭包队列推给 worker 执行，
-    // 实现"单个账号的重脚本不冻结全局事件循环"的隔离；worker 产生的命令/日志
-    // 经反向队列回主线程实际发包/显示。QuickJS 运行时在同一 worker 线程上创建与释放。
-    void start_trig_worker();    // 启动 worker（幂等；须在设置好 trig 回调后调用）
-    void stop_trig_worker();     // 请求 worker 释放 JS 运行时并 join（幂等）
-    void enqueue_trig(std::function<void()> fn);  // 主线程 → worker
+    // ---------- 触发器 worker（共享线程池中的一条，独占 QuickJS 运行时） ----------
+    // 线程总数由 WorkerPool 封顶（默认 min(硬件并发,8)），账号多时共享负载最轻的 worker，
+    // 空闲线程阻塞不占 CPU。主线程把 trig.on_* / tick / replace 等经闭包队列推给该 worker
+    // 执行，实现"单个账号的重脚本不冻结全局事件循环"的隔离；worker 产生的命令/日志
+    // 经反向队列回主线程实际发包/显示。QuickJS 运行时始终在账号绑定的同一条 worker 上
+    // 创建与释放（线程亲和）。
+    void start_trig_worker();    // 绑定一条池 worker（幂等；须在设置好 trig 回调后调用）
+    void stop_trig_worker();     // 提交 JS 释放闭包并等待其执行完，再归还 worker（幂等）
+    void enqueue_trig(std::function<void()> fn);  // 主线程 → 绑定 worker
     void post_main(std::function<void()> fn);     // worker → 主线程（send/log）
     void drain_trig_main();      // 主循环每帧排空 worker→主 出队闭包
     std::string get_state_json();  // worker 读主线程缓存的状态快照（互斥锁保护）
@@ -185,13 +188,10 @@ private:
     static std::string state_word(const std::string& raw);   // state 文本 → 状态关键词
 
     // ---------- worker 支撑 ----------
-    std::thread trig_worker_;                     // 触发器执行线程（engine 独占）
-    bool worker_started_ = false;                 // worker 是否在跑（enqueue 守卫）
-    ConcurrentQueue<std::function<void()>> trig_q_;   // 主线程 → worker（事件/替换/tick/release）
+    int worker_ = -1;                                 // 绑定的池 worker 索引（-1=未绑定）
     ConcurrentQueue<std::function<void()>> main_q_;   // worker → 主线程（send/log 闭包）
     std::mutex st_jm_;                            // 保护 state_j_（worker 快照读取）
     std::string state_j_;                         // 主线程缓存的状态快照 JSON
-    void worker_loop();                           // worker 运行体
     void publish_state();                         // 主线程：把 my_* 生成快照写入 state_j_（持 st_jm_）
 };
 
