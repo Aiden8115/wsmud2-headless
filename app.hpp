@@ -3,6 +3,7 @@
 // 供 commands.cpp / tui_ui.cpp / main.cpp 使用。文件内私有的小函数不进本头。
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,7 @@ using namespace wsmud;  // 使 wsmud::tui::* 可用
 // ---------- 全局状态（定义于 main.cpp） ----------
 
 extern int slots;                     // 顶栏标签页数量（初始 5，可 F7 追加 / DEL 删除）
-extern std::vector<Account> accounts;
+extern std::vector<std::unique_ptr<Account>> accounts;
 extern bool quitting;                 // true=退出程序（F10 / Ctrl+C）
 extern int sel;                       // 当前选中槽位（0-based）
 extern bool game_mode;                // F6：false=程序命令 true=游戏命令

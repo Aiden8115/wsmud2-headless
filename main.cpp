@@ -16,7 +16,7 @@
 // ---------- 全局状态（声明见 app.hpp） ----------
 
 int slots = 5;                    // 顶栏标签页数量（初始 5，可 F7 追加 / DEL 删除）
-std::vector<Account> accounts;
+std::vector<std::unique_ptr<Account>> accounts;
 bool quitting = false;
 int sel = 0;                      // 当前选中槽位（0-based）
 bool game_mode = false;           // F6：false=程序命令 true=游戏命令
@@ -241,16 +241,17 @@ void startup_prompt() {
     if (count < 1) count = 1;
     if (count > 10) count = 10;
     accounts.resize(static_cast<std::size_t>(count));
-
-    for (auto& a : accounts) {
-        a.index = static_cast<int>(&a - accounts.data()) + 1;
+    for (std::size_t i = 0; i < accounts.size(); ++i) {
+        accounts[i] = std::make_unique<Account>();
+        auto& a = *accounts[i];
+        a.index = static_cast<int>(i) + 1;
         a.set_log(account_log);
         a.set_chat(account_chat);
     }
     reload_triggers();  // 经典模式：启动即加载 trigger.json
 
-    for (int i = 0; i < count; ++i) {
-        auto& a = accounts[static_cast<std::size_t>(i)];
+    for (std::size_t i = 0; i < accounts.size(); ++i) {
+        auto& a = *accounts[i];
         std::printf("--- 账号 %d ---\n", a.index);
         a.account = read_line_prompt("账号: ");
         if (a.account.empty()) {
@@ -284,18 +285,18 @@ void classic_run_loop() {
         struct pollfd in = {STDIN_FILENO, POLLIN, 0};
         fds.push_back(in);
         for (auto& a : accounts) {
-            if (a.http.conn().fd >= 0) {
+            if (a->http.conn().fd >= 0) {
                 // 仅当有数据要写（或正在连接）才请求 POLLOUT：
                 // 已连接的空闲 socket 恒可写，若总是轮询 POLLOUT 会让 poll 永不阻塞、单核跑满
                 short ev = POLLIN;
-                if (a.http.conn().wants_write()) ev |= POLLOUT;
-                struct pollfd p = {a.http.conn().fd, ev, 0};
+                if (a->http.conn().wants_write()) ev |= POLLOUT;
+                struct pollfd p = {a->http.conn().fd, ev, 0};
                 fds.push_back(p);
             }
-            if (a.ws.conn().fd >= 0) {
+            if (a->ws.conn().fd >= 0) {
                 short ev = POLLIN;
-                if (a.ws.conn().wants_write()) ev |= POLLOUT;
-                struct pollfd p = {a.ws.conn().fd, ev, 0};
+                if (a->ws.conn().wants_write()) ev |= POLLOUT;
+                struct pollfd p = {a->ws.conn().fd, ev, 0};
                 fds.push_back(p);
             }
         }
@@ -319,10 +320,10 @@ void classic_run_loop() {
             }
         }
 
-        for (auto& a : accounts) a.tick(now);
+        for (auto& a : accounts) a->tick(now);
         for (auto& a : accounts) {
-            if (a.http.conn().fd >= 0) a.http.conn().flush();
-            if (a.ws.conn().fd >= 0) a.ws.conn().flush();
+            if (a->http.conn().fd >= 0) a->http.conn().flush();
+            if (a->ws.conn().fd >= 0) a->ws.conn().flush();
         }
     }
 }
@@ -378,10 +379,11 @@ int main() {
         acc_chat_logs.resize(static_cast<std::size_t>(slots));
         acc_pkt_logs.resize(static_cast<std::size_t>(slots));
         for (std::size_t i = 0; i < accounts.size(); ++i) {
-            accounts[i].index = static_cast<int>(i) + 1;
-            accounts[i].set_log(account_log);
-            accounts[i].set_chat(account_chat);
-            accounts[i].set_packet(account_packet);
+            accounts[i] = std::make_unique<Account>();
+            accounts[i]->index = static_cast<int>(i) + 1;
+            accounts[i]->set_log(account_log);
+            accounts[i]->set_chat(account_chat);
+            accounts[i]->set_packet(account_packet);
         }
         reload_triggers();  // 启动即加载 trigger.json（不存在则创建空模板）
         refresh_input_state();  // 初次进入：选中 F1 未配置 → 立即提示录入账号
@@ -395,6 +397,6 @@ int main() {
         std::printf("正在退出...\n");
     }
 
-    for (auto& a : accounts) a.disconnect();
+    for (auto& a : accounts) a->disconnect();
     return 0;
 }

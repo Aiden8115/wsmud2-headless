@@ -265,16 +265,16 @@ void editor_enter() {
 
 // 当前账号可见（可编辑）的私有触发器：仅 owner==该玩家名（全局共享触发器不进入某玩家的编辑列表）
 std::vector<wsmud::trigger::Trigger> my_visible() {
-    const auto& my = accounts[static_cast<std::size_t>(sel)].my_name;
+    const auto& my = accounts[static_cast<std::size_t>(sel)]->my_name;
     std::vector<wsmud::trigger::Trigger> mine;
-    for (const auto& t : accounts[static_cast<std::size_t>(sel)].trig.list())
+    for (const auto& t : accounts[static_cast<std::size_t>(sel)]->trig.list())
         if (t.owner == my) mine.push_back(t);
     return mine;
 }
 
 // 用"其它玩家 + 全局共享" + 当前玩家新私有列表，重建全局配置（g_trig_cfg）
 void apply_mine(const std::vector<wsmud::trigger::Trigger>& mine) {
-    const auto& my = accounts[static_cast<std::size_t>(sel)].my_name;
+    const auto& my = accounts[static_cast<std::size_t>(sel)]->my_name;
     std::vector<wsmud::trigger::Trigger> next;
     for (const auto& t : g_trig_cfg)
         if (t.owner != my) next.push_back(t);
@@ -306,7 +306,7 @@ void editor_save() {
     }
     mine = tmp.list();
     if (e.target < 0 && !mine.empty())
-        mine.back().owner = accounts[static_cast<std::size_t>(sel)].my_name;   // 新建归属当前玩家
+        mine.back().owner = accounts[static_cast<std::size_t>(sel)]->my_name;   // 新建归属当前玩家
     apply_mine(mine);
     close_editor();
     persist_triggers();
@@ -563,7 +563,7 @@ void render() {
     for (int i = 0; i < slots; ++i) {
         tui::SlotBar sb;
         sb.selected = (i == sel);
-        const Account& a = accounts[static_cast<std::size_t>(i)];
+        const Account& a = *accounts[static_cast<std::size_t>(i)];
         if (a.account.empty()) {
             sb.state = 0;
         } else if (a.stage == Account::Stage::Online) {
@@ -636,7 +636,7 @@ void render() {
         // 反色高亮必须 +1，否则落在选中触发器上方一行
         f.list_cursor = list_cursor + 1;
         f.list_title = "账号" + std::to_string(sel + 1) + " 触发器列表（F8 编辑 · 空格开关 · d 删除 · a 新增 · Esc 返回）";
-        const auto& tl = accounts[static_cast<std::size_t>(sel)].trig.list();
+        const auto& tl = accounts[static_cast<std::size_t>(sel)]->trig.list();
         f.list_lines.clear();
         f.list_lines.push_back("trigger list 查看 · reloadTrigger 重载");
         std::size_t n = tl.size();
@@ -695,7 +695,7 @@ void render() {
 
 void refresh_input_state() {
     if (game_mode) { input_stage = InputStage::None; return; }
-    if (accounts[static_cast<std::size_t>(sel)].account.empty()) {
+    if (accounts[static_cast<std::size_t>(sel)]->account.empty()) {
         if (input_stage == InputStage::None) input_stage = InputStage::Account;
     } else if (input_stage == InputStage::Account || input_stage == InputStage::Password) {
         input_stage = InputStage::None;
@@ -710,7 +710,7 @@ void select_slot(int n) {  // 0-based
     // 触发器界面仅对已登录槽位开放：切到未进入游戏的槽位时退出触发界面
     // （防止停留在无身份的空列表，或看到他人触发器）
     if (view == View::TrigList) {
-        const Account& a = accounts[static_cast<std::size_t>(sel)];
+        const Account& a = *accounts[static_cast<std::size_t>(sel)];
         if (a.stage != Account::Stage::Online) close_list();
     }
     refresh_input_state();
@@ -722,7 +722,7 @@ void submit() {
     line = trim(line);
 
     if (input_stage == InputStage::Account) {
-        auto& a = accounts[static_cast<std::size_t>(sel)];
+        auto& a = *accounts[static_cast<std::size_t>(sel)];
         if (line.empty()) {
             out("账号不能为空");
             return;
@@ -732,7 +732,7 @@ void submit() {
         return;
     }
     if (input_stage == InputStage::Password) {
-        auto& a = accounts[static_cast<std::size_t>(sel)];
+        auto& a = *accounts[static_cast<std::size_t>(sel)];
         if (line.empty()) {
             out("密码不能为空");
             input_stage = InputStage::Account;
@@ -747,13 +747,13 @@ void submit() {
 
     // 命令模式：优先路由需要输入的账号（选服务器/角色）
     for (auto& a : accounts) {
-        if (a.need != Account::Need::None) {
+        if (a->need != Account::Need::None) {
             process_line(line);
             return;
         }
     }
     if (game_mode) {
-        auto& a = accounts[static_cast<std::size_t>(sel)];
+        auto& a = *accounts[static_cast<std::size_t>(sel)];
         if (a.account.empty()) {
             out("槽位" + std::to_string(sel + 1) + " 未配置账号");
             return;
@@ -769,9 +769,10 @@ void submit() {
 // F7 追加标签页（新增标签页无直接切换快捷键，用 ←/→ 移动）
 void add_tab() {
     if (slots >= 20) { out("标签页已达上限（20）"); return; }
-    // Account 含 move-only 的触发器引擎，用 emplace_back 就地构造
-    accounts.emplace_back();
-    Account& a = accounts.back();
+    // 指针稳定存储：unique_ptr 使 Account 地址在 vector 重排时保持不变，
+    // 触发器 worker 线程上捕获的 this 因此不会悬垂。
+    accounts.push_back(std::make_unique<Account>());
+    Account& a = *accounts.back();
     a.index = slots + 1;   // 新标签页序号（1-based）
     a.set_log(account_log);
     a.set_chat(account_chat);
@@ -790,15 +791,16 @@ void del_tab() {
         out("只能删除序号大于 5 的标签页（当前为 F" + std::to_string(sel + 1) + "）");
         return;
     }
-    accounts[static_cast<std::size_t>(sel)].disconnect();  // 先关闭该标签页的网络连接
+    accounts[static_cast<std::size_t>(sel)]->disconnect();  // 先关闭该标签页的网络连接
     accounts.erase(accounts.begin() + static_cast<std::ptrdiff_t>(sel));
     acc_logs.erase(acc_logs.begin() + static_cast<std::ptrdiff_t>(sel));
     acc_chat_logs.erase(acc_chat_logs.begin() + static_cast<std::ptrdiff_t>(sel));
     acc_pkt_logs.erase(acc_pkt_logs.begin() + static_cast<std::ptrdiff_t>(sel));
     --slots;
-    // 删除后索引前移，重新编号保持 account.index == 标签页序号
+    // 删除后索引前移，重新编号保持 account.index == 标签页序号。
+    // unique_ptr 存储下元素仅移动指针，Address 不变，worker 线程闭包缓存的 this 依旧有效。
     for (std::size_t i = 0; i < accounts.size(); ++i)
-        accounts[i].index = static_cast<int>(i) + 1;
+        accounts[i]->index = static_cast<int>(i) + 1;
     if (sel >= slots) sel = slots - 1;
     scroll_offset = 0;
     chat_scroll_offset = 0;
@@ -817,7 +819,7 @@ bool dir_up() {
 }
 bool dir_down() {
     if (view == View::TrigList) {
-        std::size_t n = accounts[static_cast<std::size_t>(sel)].trig.list().size();
+        std::size_t n = accounts[static_cast<std::size_t>(sel)]->trig.list().size();
         if (n > 0 && static_cast<std::size_t>(list_cursor) < n - 1) ++list_cursor;
         return false;
     }
@@ -846,7 +848,7 @@ void handle_fn(int fn) {  // fn: 1-12
         if (view == View::Logs) {
             // 触发器是玩家独有的：仅在已进入游戏（Online）时可见/本玩家自己的触发器，
             // 未登录（Not 进入游戏）的槽位阻止进入，避免在无玩家身份时空看或误改他人触发器。
-            const Account& a = accounts[static_cast<std::size_t>(sel)];
+            const Account& a = *accounts[static_cast<std::size_t>(sel)];
             if (a.stage != Account::Stage::Online) {
                 out("触发器界面仅对已登录玩家开放：当前槽位未进入游戏，无法访问自己的触发器");
                 return;
@@ -901,18 +903,18 @@ void tui_run_loop() {
         struct pollfd in = {STDIN_FILENO, POLLIN, 0};
         fds.push_back(in);
         for (auto& a : accounts) {
-            if (a.http.conn().fd >= 0) {
+            if (a->http.conn().fd >= 0) {
                 // 仅当有数据要写（或正在连接）才请求 POLLOUT：
                 // 已连接的空闲 socket 恒可写，若总是轮询 POLLOUT 会让 poll 永不阻塞、单核跑满
                 short ev = POLLIN;
-                if (a.http.conn().wants_write()) ev |= POLLOUT;
-                struct pollfd p = {a.http.conn().fd, ev, 0};
+                if (a->http.conn().wants_write()) ev |= POLLOUT;
+                struct pollfd p = {a->http.conn().fd, ev, 0};
                 fds.push_back(p);
             }
-            if (a.ws.conn().fd >= 0) {
+            if (a->ws.conn().fd >= 0) {
                 short ev = POLLIN;
-                if (a.ws.conn().wants_write()) ev |= POLLOUT;
-                struct pollfd p = {a.ws.conn().fd, ev, 0};
+                if (a->ws.conn().wants_write()) ev |= POLLOUT;
+                struct pollfd p = {a->ws.conn().fd, ev, 0};
                 fds.push_back(p);
             }
         }
@@ -955,29 +957,29 @@ void tui_run_loop() {
         }
         if (quitting) break;
 
-        for (auto& a : accounts) a.tick(now);
+        for (auto& a : accounts) a->tick(now);
         // 登录失败（如密码错误）：自动回退到该槽位的账号/密码录入阶段，避免卡死
         for (auto& a : accounts) {
-            if (a.stage == Account::Stage::Disconnected &&
-                !a.account.empty() &&
-                a.last_error.rfind("登录失败", 0) == 0) {
-                a.account.clear();
-                a.password.clear();
-                a.need = Account::Need::None;
-                a.stage = Account::Stage::None;
-                acc_logs[static_cast<std::size_t>(a.index - 1)].clear();  // 槽位重置时清空该标签页输出区
-                acc_chat_logs[static_cast<std::size_t>(a.index - 1)].clear();  // 同步清空聊天区
-                acc_pkt_logs[static_cast<std::size_t>(a.index - 1)].clear();   // 同步清空网络包栏
-                account_log(a.index, "登录失败，该槽位已重置，请重新录入账号密码");
-                if (sel == a.index - 1) {
+            if (a->stage == Account::Stage::Disconnected &&
+                !a->account.empty() &&
+                a->last_error.rfind("登录失败", 0) == 0) {
+                a->account.clear();
+                a->password.clear();
+                a->need = Account::Need::None;
+                a->stage = Account::Stage::None;
+                acc_logs[static_cast<std::size_t>(a->index - 1)].clear();  // 槽位重置时清空该标签页输出区
+                acc_chat_logs[static_cast<std::size_t>(a->index - 1)].clear();  // 同步清空聊天区
+                acc_pkt_logs[static_cast<std::size_t>(a->index - 1)].clear();   // 同步清空网络包栏
+                account_log(a->index, "登录失败，该槽位已重置，请重新录入账号密码");
+                if (sel == a->index - 1) {
                     input_stage = InputStage::Account;
                     cmd_buf.clear();
                 }
             }
         }
         for (auto& a : accounts) {
-            if (a.http.conn().fd >= 0) a.http.conn().flush();
-            if (a.ws.conn().fd >= 0) a.ws.conn().flush();
+            if (a->http.conn().fd >= 0) a->http.conn().flush();
+            if (a->ws.conn().fd >= 0) a->ws.conn().flush();
         }
         // 渲染节流：有输入立即刷新；无输入则内容更新最迟 RENDER_MIN_INTERVAL_MS 刷新一次
         if (need_render || now - last_render_ms >= RENDER_MIN_INTERVAL_MS) {

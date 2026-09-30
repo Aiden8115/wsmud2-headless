@@ -46,14 +46,14 @@ bool write_atomic(const std::string& path, const std::string& content, std::stri
 
 void cmd_status() {
     for (auto& a : accounts) {
-        const char* st = stage_name(a.stage);
-        if (a.stage == Account::Stage::Online) {
-            out("[账号" + std::to_string(a.index) + "] " + st + " | " + a.role.name + " Lv." +
-                std::to_string(a.role.level) + " | 服务器: " + a.server.name);
-        } else if (a.stage == Account::Stage::Disconnected) {
-            out("[账号" + std::to_string(a.index) + "] " + st + " | 原因: " + a.last_error);
+        const char* st = stage_name(a->stage);
+        if (a->stage == Account::Stage::Online) {
+            out("[账号" + std::to_string(a->index) + "] " + st + " | " + a->role.name + " Lv." +
+                std::to_string(a->role.level) + " | 服务器: " + a->server.name);
+        } else if (a->stage == Account::Stage::Disconnected) {
+            out("[账号" + std::to_string(a->index) + "] " + st + " | 原因: " + a->last_error);
         } else {
-            out("[账号" + std::to_string(a.index) + "] " + st);
+            out("[账号" + std::to_string(a->index) + "] " + st);
         }
     }
 }
@@ -67,7 +67,7 @@ void cmd_help() {
 
 void cmd_reconnect(const std::string& arg) {
     if (arg.empty() || arg == "all") {
-        for (auto& a : accounts) a.reconnect();
+        for (auto& a : accounts) a->reconnect();
         return;
     }
     int n;
@@ -76,7 +76,7 @@ void cmd_reconnect(const std::string& arg) {
         out("账号序号无效（1-" + std::to_string(nacc) + "）");
         return;
     }
-    accounts[n - 1].reconnect();
+    accounts[n - 1]->reconnect();
 }
 
 void cmd_send(const std::string& arg) {
@@ -91,14 +91,14 @@ void cmd_send(const std::string& arg) {
         out("账号序号无效（1-" + std::to_string(nacc) + "）");
         return;
     }
-    accounts[n - 1].send_command(trim(arg.substr(sp + 1)));
+    accounts[n - 1]->send_command(trim(arg.substr(sp + 1)));
 }
 
 // ---------- 触发器命令（trigger list 只读查看） ----------
 
 void cmd_trigger(const std::string& arg) {
     if (arg.empty() || arg == "list") {
-        const auto& list = accounts[static_cast<std::size_t>(sel)].trig.list();
+        const auto& list = accounts[static_cast<std::size_t>(sel)]->trig.list();
         if (list.empty()) { out("账号" + std::to_string(sel + 1) + " 暂无触发器，请编辑 trigger.json 后输入 reloadTrigger 重载"); return; }
         for (std::size_t i = 0; i < list.size(); ++i)
             out("#" + std::to_string(i + 1) + " [" + (list[i].active ? "启用" : "停用") + "] " +
@@ -167,7 +167,7 @@ void reload_triggers() {
         return;
     }
     g_trig_cfg = list;
-    for (auto& a : accounts) a.set_triggers_all(list);
+    for (auto& a : accounts) a->set_triggers_all(list);
     out("已重载 " + std::to_string(list.size()) + " 个触发器（trigger.json）");
 }
 
@@ -192,7 +192,7 @@ void persist_triggers() {
     if (!ok) { out("[保存失败] " + (err.empty() ? "校验读回异常" : err) + "（未写盘，内存配置保留）"); return; }
     if (!write_atomic(path, text, err)) { out("[保存失败] " + err + "（未写盘，内存配置保留）"); return; }
     g_trig_cfg = std::move(check);   // 以读回的规范化配置作为唯一真相
-    for (auto& a : accounts) a.set_triggers_all(g_trig_cfg);
+    for (auto& a : accounts) a->set_triggers_all(g_trig_cfg);
     out("已保存 " + std::to_string(g_trig_cfg.size()) + " 个触发器（trigger.json）");
 }
 
@@ -204,7 +204,7 @@ void process_line(const std::string& raw) {
     // quit：退出当前选中槽位的账号并重置，回到账号/密码录入阶段，避免该标签页废掉
     //（退出程序请用 F10 或 Ctrl+C）
     if (line == "quit" || line == "exit") {
-        auto& a = accounts[static_cast<std::size_t>(sel)];
+        auto& a = *accounts[static_cast<std::size_t>(sel)];
         if (a.account.empty()) {
             out("槽位" + std::to_string(sel + 1) + " 未配置账号");
             return;
@@ -232,14 +232,14 @@ void process_line(const std::string& raw) {
 
     // 优先路由给等待输入的账号（选择服务器/角色）
     for (auto& a : accounts) {
-        if (a.need != Account::Need::None) {
+        if (a->need != Account::Need::None) {
             int n;
             if (!parse_int(line, n)) {
-                out("请输入序号：" + a.prompt);
+                out("请输入序号：" + a->prompt);
                 return;
             }
-            if (a.need == Account::Need::Server) a.select_server(n - 1);
-            else a.select_role(n - 1);
+            if (a->need == Account::Need::Server) a->select_server(n - 1);
+            else a->select_role(n - 1);
             return;
         }
     }
