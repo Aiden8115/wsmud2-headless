@@ -37,6 +37,10 @@ struct Frame {
     std::vector<std::string> chats;  // 聊天区消息（输出区上 1/3，自动取末尾可见行）
     std::vector<std::string> pkt_logs;  // 右侧"网络包"栏原始包（每元素一包，多行；渲染时按栏宽折行并与聊天/文本区以一列 | 分隔）
     int pkt_scroll_offset = 0;         // 网络包栏向上滚动行数（[上翻 / ]下翻）
+    // 右侧"房间"区（位于网络包栏上方）：标题=房间名，出口一行，人物固定预留 5 行
+    std::string room_name;             // 房间名（空则显示占位"房间"）
+    std::string room_exits;            // 出口文本（如 "南：青草坪；东：木板路"；空则不占行）
+    std::vector<std::string> room_people;  // 房间人物（最多 5 行，已按显示顺序：后 5 个倒序）
     std::string cmd_prompt;      // "命令" / "游戏命令" / "账号n" / "密码n"
     std::string cmd_text;        // 当前输入（密码模式下会显示为 *）
     bool mask_input = false;     // 密码回显掩码

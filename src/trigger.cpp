@@ -27,11 +27,18 @@ int64_t mono_ms() {
     return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// double → int64：仅在可表示范围内转换（[conv.fpint] 规定超范围转换是 UB），成功返回 true
+bool double_to_i64(double d, int64_t& out) {
+    if (!std::isfinite(d)) return false;
+    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
+    out = static_cast<int64_t>(d);
+    return true;
+}
+
 // JS 数值转字符串（整数不打小数位）
 std::string num_str(double d) {
-    if (std::isfinite(d) && d == static_cast<int64_t>(d)) {
-        return std::to_string(static_cast<int64_t>(d));
-    }
+    int64_t i;
+    if (double_to_i64(d, i) && d == static_cast<double>(i)) return std::to_string(i);
     char b[40];
     snprintf(b, sizeof b, "%g", d);
     return b;
@@ -554,7 +561,9 @@ Engine::Engine(Engine&& o) noexcept
 }
 Engine& Engine::operator=(Engine&& o) noexcept {
     if (this == &o) return *this;
-    this->~Engine();
+    // 只释放自身持有的 JS 运行时（release 幂等）；不可调用 this->~Engine()——
+    // 析构后再对已结束生命周期的对象成员赋值属 UB
+    release();
     js_env_ = o.js_env_; o.js_env_ = nullptr;
     interrupt_count_ = o.interrupt_count_;
     triggers_ = std::move(o.triggers_);
@@ -799,7 +808,7 @@ void Engine::on_auction(const std::string& id, const std::string& raw_name,
     }
     int64_t time = 0;
     double tsec = parse_float(raw_time) / 1000.0;
-    if (std::isfinite(tsec)) time = static_cast<int64_t>(std::floor(tsec));
+    double_to_i64(std::floor(tsec), time);  // 超范围/非有限时保持 0，避免 UB
     Params p;
     p["keyword"] = name;
     p["item_level"] = grade;
@@ -903,7 +912,8 @@ void Engine::on_dispfm(const std::string& id, const std::string& rtime,
 
     // 冷却跟踪 + 调度"skill_cd"
     double cd = parse_float(distime);
-    int64_t cd_ms = std::isfinite(cd) && cd > 0 ? static_cast<int64_t>(cd) : 0;
+    int64_t cd_ms = 0;
+    if (cd > 0) double_to_i64(cd, cd_ms);  // 超范围/非有限时保持 0，避免 UB
     cooldowns_[id] = now + cd_ms;
     pending_cd_.push_back({now + cd_ms, id});
 }

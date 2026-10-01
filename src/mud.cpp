@@ -1,5 +1,6 @@
 #include "mud.hpp"
 
+#include <cmath>    // std::isfinite：double→整数转换前的范围守卫
 #include <cstdio>
 #include <future>   // std::promise：stop_trig_worker 同步等待 release 闭包执行
 #include <memory>   // std::make_shared
@@ -23,13 +24,44 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
+// double → int64：仅在可表示范围内转换（[conv.fpint] 规定超范围转换是 UB），成功返回 true
+bool double_to_i64(double d, int64_t& out) {
+    if (!std::isfinite(d)) return false;
+    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
+    out = static_cast<int64_t>(d);
+    return true;
+}
+
+// 房间出口对象 → "南：青草坪；东：木板路"（按常见方位排序；未知方向键保留原样排最后）
+std::string format_exits(const json::Value& items) {
+    static const struct { const char* key; const char* label; } DIRS[] = {
+        {"north", "北"}, {"south", "南"}, {"east", "东"}, {"west", "西"},
+        {"up", "上"}, {"down", "下"}, {"enter", "进"}, {"out", "出"},
+        {"northeast", "东北"}, {"northwest", "西北"}, {"southeast", "东南"}, {"southwest", "西南"},
+    };
+    if (!items.is_object()) return "";
+    std::string out;
+    auto add = [&](const std::string& label, const std::string& to) {
+        if (to.empty()) return;
+        if (!out.empty()) out += "；";
+        out += label + "：" + html_to_ansi(to);
+    };
+    for (const auto& d : DIRS) add(d.label, items.get(d.key).as_string());
+    for (const auto& kv : items.as_object()) {
+        bool known = false;
+        for (const auto& d : DIRS) if (kv.first == d.key) { known = true; break; }
+        if (!known) add(kv.first, kv.second.as_string());
+    }
+    return out;
+}
+
 // JSON 值 → 字符串（数字尽量整数；null/缺键 → 空串）
 std::string val_str(const json::Value& v) {
     if (v.is_string()) return v.as_string();
     if (v.is_number()) {
         double d = v.as_number();
-        int64_t i = static_cast<int64_t>(d);
-        if (d == static_cast<double>(i)) return std::to_string(i);
+        int64_t i;
+        if (double_to_i64(d, i) && d == static_cast<double>(i)) return std::to_string(i);
         char buf[40];
         std::snprintf(buf, sizeof buf, "%.2f", d);
         return buf;
@@ -356,18 +388,26 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
             trig_on_sc(v);
         } else if (type == "items") {
             trig_on_items(v);
+            room_set_people(v.get("items"));
         } else if (type == "itemadd") {
             trig_on_itemadd(v);
+            room_add_person(v);
         } else if (type == "itemremove") {
             const std::string id = v.get("id").as_string();
+            room_remove_person(id);
             enqueue_trig([this, id] { trig.on_itemremove(id); });
         } else if (type == "state") {
             my_state_text = state_word(v.get("state").as_string());
             update_idle(now_ms());
         } else if (type == "room") {
             my_room_name = v.get("name").as_string();
+            // 换房间：出口/人物由随后的 exits/items 包重建，先清空避免残留上一个房间的信息
+            my_room_exits.clear();
+            my_room_people.clear();
             publish_state();
             enqueue_trig([this] { trig.on_room_clear(); });
+        } else if (type == "exits") {
+            my_room_exits = format_exits(v.get("items"));
         }
     }
 
@@ -397,8 +437,13 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
         else if (dialog == "pm") trig_on_pm(v);
         else if (dialog == "events") trig_on_events(v);
     }
-    // 走到这里说明该包未显示在聊天区/文本区：status/combat/die/dispfm/sc/items/
-    // itemadd/itemremove/state/room、dialog 包及未知类型 → 记入右侧"网络包"栏
+    // 已被右侧"房间"区消费的包（room/exits/items/itemadd/itemremove）不再记入网络包栏，避免污染
+    if (type == "room" || type == "exits" || type == "items" ||
+        type == "itemadd" || type == "itemremove") {
+        return;
+    }
+    // 走到这里说明该包未显示在聊天区/文本区：status/combat/die/dispfm/sc/state、
+    // dialog 包及未知类型 → 记入右侧"网络包"栏
     log_pkt(raw);
 }
 
@@ -626,6 +671,37 @@ void Account::trig_on_itemadd(const json::Value& v) {
     enqueue_trig([this, id, name] { trig.on_itemadd(id, name); });
 }
 
+// ---------- 房间面板数据（右侧"房间"区） ----------
+
+void Account::room_set_people(const json::Value& arr) {
+    my_room_people.clear();
+    if (!arr.is_array()) return;
+    for (const auto& it : arr.as_array()) {
+        if (!it.is_object()) continue;                    // 数组尾部可能混入非对象项
+        const std::string name = it.get("name").as_string();
+        if (name.empty()) continue;
+        my_room_people.emplace_back(it.get("id").as_string(), html_to_ansi(name));
+    }
+}
+
+void Account::room_add_person(const json::Value& v) {
+    const std::string name = v.get("name").as_string();
+    if (name.empty()) return;
+    const std::string id = v.get("id").as_string();
+    if (!id.empty()) {
+        for (const auto& p : my_room_people)
+            if (p.first == id) return;                    // 已在列表中
+    }
+    my_room_people.emplace_back(id, html_to_ansi(name));
+}
+
+void Account::room_remove_person(const std::string& id) {
+    if (id.empty()) return;
+    for (auto it = my_room_people.begin(); it != my_room_people.end(); ++it) {
+        if (it->first == id) { my_room_people.erase(it); return; }
+    }
+}
+
 void Account::trig_on_sc(const json::Value& v) {
     const std::string id = v.get("id").as_string();
     const std::string hp = val_str(v.get("hp")), mp = val_str(v.get("mp"));
@@ -700,13 +776,13 @@ void Account::trig_on_events(const json::Value& v) {
         // 时间戳：与扩展一致——boss 且 item[4] 非数字且 item[5] 存在 → 用 item[5]；否则 item[4]
         const json::Value& v4 = arr.size() > 4 ? arr[4] : json::Value();
         const json::Value& v5 = arr.size() > 5 ? arr[5] : json::Value();
-        int64_t full_ms = 0;
+        int64_t full_ms = 0;   // double→int64 超范围时会保持 0，避免 UB
         if (aname == "boss" && !v4.is_null() && !v4.is_number() && !v5.is_null()) {
-            full_ms = static_cast<int64_t>(v5.is_number() ? v5.as_number() : std::atof(v5.as_string().c_str()));
+            double_to_i64(v5.is_number() ? v5.as_number() : std::atof(v5.as_string().c_str()), full_ms);
         } else if (!v4.is_null() && v4.is_number() && v4.as_number() != 0) {
-            full_ms = static_cast<int64_t>(v4.as_number());
+            double_to_i64(v4.as_number(), full_ms);
         } else if (!v4.is_null() && !v4.is_number() && !v4.as_string().empty()) {
-            full_ms = static_cast<int64_t>(std::atof(v4.as_string().c_str()));
+            double_to_i64(std::atof(v4.as_string().c_str()), full_ms);
         }
         // times = 自当日 0 点起的秒数（与扩展 todayStart 计算一致）
         std::string times;

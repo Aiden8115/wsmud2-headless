@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <cstdint>
 #include <ctime>
@@ -111,6 +112,8 @@ public:
     int my_level = 0;              // 当前等级
     std::string my_state_text = "发呆"; // 状态关键词（RoleState 中文词，如 疗伤/打坐/发呆）
     std::string my_room_name;      // 当前房间名
+    std::string my_room_exits;     // 房间出口（已格式化，如 "南：青草坪；东：木板路"，颜色已转 ANSI）
+    std::vector<std::pair<std::string, std::string>> my_room_people;  // 房间人物 (id, 显示名)，保持服务器顺序
     double my_hp = 0, my_max_hp = 0, my_mp = 0, my_max_mp = 0;
     bool my_living = true;         // 是否存活（die/relive）
     bool my_combat = false;        // 是否在战斗
@@ -197,6 +200,11 @@ private:
     void trig_on_pack(const json::Value& v);
     void trig_on_social(const json::Value& v);
     static std::string state_word(const std::string& raw);   // state 文本 → 状态关键词
+
+    // 房间面板（右侧"房间"区）数据：由 items/itemadd/itemremove 包维护
+    void room_set_people(const json::Value& arr);            // items：整表重建
+    void room_add_person(const json::Value& v);              // itemadd：追加（按 id 去重）
+    void room_remove_person(const std::string& id);          // itemremove：按 id 删除
 
     // ---------- worker 支撑 ----------
     int worker_ = -1;                                 // 绑定的池 worker 索引（-1=未绑定）

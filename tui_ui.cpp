@@ -351,7 +351,11 @@ bool handle_editor_byte_ns(unsigned char c, EscState& es) {
             return false;
         case 1:
             if (c == '[') { es.st = 2; return false; }
+            // 消歧窗口内有后续字节但非 CSI 序列：视为已按 Esc → 放弃编辑并退回列表。
+            // 与列表视图(case1 close_list)、source 编辑(case1 source_save_return)保持一致，
+            // 避免第一下 Esc 因后续字节被吞而"无响应"，需再按一次才生效。
             es.st = 0;
+            close_editor();
             return false;
         case 2:
             if (c == 'A') { es.st = 0; editor_move(-1); return false; }
@@ -653,6 +657,16 @@ void render() {
     f.chats = acc_chat_logs[static_cast<std::size_t>(sel)];  // 聊天区（输出区上 1/3）
     f.pkt_logs = acc_pkt_logs[static_cast<std::size_t>(sel)];  // 网络包栏（右侧独立一列）
     f.pkt_scroll_offset = pkt_scroll_offset;  // [上翻 / ]下翻
+    // 右侧"房间"区（网络包栏上方）：标题=房间名，出口一行，人物取列表中后 5 个的倒序
+    {
+        const Account& cur = *accounts[static_cast<std::size_t>(sel)];
+        if (!cur.my_room_name.empty()) f.room_name = wsmud::html_to_ansi(cur.my_room_name);
+        f.room_exits = cur.my_room_exits;
+        const auto& ppl = cur.my_room_people;
+        std::size_t take = ppl.size() < 5 ? ppl.size() : 5;
+        for (std::size_t k = 0; k < take; ++k)
+            f.room_people.push_back(ppl[ppl.size() - 1 - k].second);
+    }
     // 点击区域：顶栏槽位（所有视图都可用）
     g_zones.clear();
     {

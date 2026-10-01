@@ -208,17 +208,23 @@ std::string dump_string(const std::string& s) {
     return out;
 }
 
+// double → long long：仅在可表示范围内转换（[conv.fpint] 规定超范围转换是 UB），成功返回 true
+bool double_to_i64(double d, long long& out) {
+    if (!std::isfinite(d)) return false;
+    if (d < -9223372036854775808.0 || d >= 9223372036854775808.0) return false;
+    out = static_cast<long long>(d);
+    return true;
+}
+
 std::string dump_impl(const Value& value) {
     switch (value.v.index()) {
         case 0: return "null";
         case 1: return std::get<bool>(value.v) ? "true" : "false";
         case 2: {
             double d = std::get<double>(value.v);
-            if (std::isfinite(d)) {
-                if (d == static_cast<double>(static_cast<long long>(d)))
-                    return std::to_string(static_cast<long long>(d));
-                return std::to_string(d);
-            }
+            long long i;
+            if (double_to_i64(d, i) && d == static_cast<double>(i)) return std::to_string(i);
+            if (std::isfinite(d)) return std::to_string(d);
             return "null";
         }
         case 3: return dump_string(std::get<std::string>(value.v));
@@ -289,14 +295,10 @@ void dump_pretty_impl(const Value& value, int depth, std::string& out) {
         case 1: out += std::get<bool>(value.v) ? "true" : "false"; break;
         case 2: {
             double d = std::get<double>(value.v);
-            if (std::isfinite(d)) {
-                if (d == static_cast<double>(static_cast<long long>(d)))
-                    out += std::to_string(static_cast<long long>(d));
-                else
-                    out += std::to_string(d);
-            } else {
-                out += "null";
-            }
+            long long i;
+            if (double_to_i64(d, i) && d == static_cast<double>(i)) out += std::to_string(i);
+            else if (std::isfinite(d)) out += std::to_string(d);
+            else out += "null";
             break;
         }
         case 3: out += dump_string(std::get<std::string>(value.v)); break;

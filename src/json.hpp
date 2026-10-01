@@ -7,6 +7,7 @@
 #include <map>
 #include <variant>
 #include <cstdint>
+#include <cmath>
 
 namespace wsmud {
 namespace json {
@@ -38,7 +39,13 @@ public:
 
     bool as_bool(bool def = false) const { return is_bool() ? std::get<bool>(v) : def; }
     double as_number(double def = 0.0) const { return is_number() ? std::get<double>(v) : def; }
-    int64_t as_int(int64_t def = 0) const { return is_number() ? static_cast<int64_t>(std::get<double>(v)) : def; }
+    int64_t as_int(int64_t def = 0) const {
+        if (!is_number()) return def;
+        double d = std::get<double>(v);
+        // double→int64 仅在可表示范围内有定义（[conv.fpint]）；超范围（如 1e30）或非有限值直接回退 def，避免 UB
+        if (!std::isfinite(d) || d < -9223372036854775808.0 || d >= 9223372036854775808.0) return def;
+        return static_cast<int64_t>(d);
+    }
     // 无参版本返回内部或空字符串的引用；带默认值版本按值返回，避免悬挂
     const std::string& as_string() const {
         static const std::string empty;

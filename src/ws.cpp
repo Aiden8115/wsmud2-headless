@@ -25,7 +25,8 @@ struct Sha1 {
 
     Sha1() { h[0] = 0x67452301; h[1] = 0xEFCDAB89; h[2] = 0x98BADCFE; h[3] = 0x10325476; h[4] = 0xC3D2E1F0; }
 
-    static uint32_t rol(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
+    // n 为 0 时 v>>32 属移位超宽（UB），单独处理
+    static uint32_t rol(uint32_t v, int n) { return n ? ((v << n) | (v >> (32 - n))) : v; }
 
     void process_block(const uint8_t* p) {
         uint32_t w[80];
@@ -302,12 +303,17 @@ bool WsClient::parse_frames(const char* data, std::size_t len, std::vector<std::
             off = 10;
         }
         if (masked) off += 4;  // 服务端帧不应有 mask
-        if (len - pos < off + plen) break;  // payload 不完整
+        // 用减法比较避免 off + plen 溢出（对端可给出 2^64-1 这类长度，溢出会让检查失效并越界读取）
+        if (off > len - pos) break;                              // 帧头不完整
+        if (plen > static_cast<uint64_t>(len - pos - off)) break;  // payload 不完整
         const char* payload = data + pos + off;
         std::string body(payload, static_cast<std::size_t>(plen));
         if (masked) {
+            // mask 键位于 payload 之前 4 字节（off 已含这 4 字节）；
+            // 原实现读 payload[4+i%4] 既取错位置、又可能越过帧尾（UB）
+            const uint8_t* mkey = reinterpret_cast<const uint8_t*>(data + pos + off - 4);
             for (std::size_t i = 0; i < body.size(); ++i)
-                body[i] = static_cast<char>(static_cast<uint8_t>(body[i]) ^ static_cast<uint8_t>(payload[4 + i % 4]));
+                body[i] = static_cast<char>(static_cast<uint8_t>(body[i]) ^ mkey[i % 4]);
         }
         pos += off + static_cast<std::size_t>(plen);
 
@@ -341,8 +347,11 @@ bool WsClient::parse_frames(const char* data, std::size_t len, std::vector<std::
                 break;  // 未知控制帧忽略
         }
     }
-    // 消费掉已完整解析的部分
-    tcp_.in.erase(tcp_.in.begin(), tcp_.in.begin() + static_cast<std::ptrdiff_t>(pos));
+    // 消费掉已完整解析的部分。
+    // 注意：本函数也用于握手阶段（数据在 hs_buf_ 中，tcp_.in 已被清空），
+    // 此时 pos 可能大于 tcp_.in.size()，直接 erase 会构造越界迭代器（UB），故做上界钳制。
+    std::size_t consume = pos < tcp_.in.size() ? pos : tcp_.in.size();
+    tcp_.in.erase(tcp_.in.begin(), tcp_.in.begin() + static_cast<std::ptrdiff_t>(consume));
     return true;
 }
 
