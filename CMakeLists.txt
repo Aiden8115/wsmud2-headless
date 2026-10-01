@@ -15,6 +15,10 @@ endif()
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/raid_interp.js INTERP_SRC)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/raid_interp.gen.hpp.in
                ${CMAKE_CURRENT_BINARY_DIR}/raid_interp.gen.hpp @ONLY)
+# 源码 js 改动必须触发重配置重新生成嵌码头文件——configure_file 默认不追踪输入变化，
+# 否则 raid_interp.js 修复后 cmake --build 仍会用旧的嵌入脚本（首条命令仍延迟 cmdDelay）
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/raid_interp.js)
 
 add_executable(wsmud2_headless
     main.cpp

@@ -93,6 +93,7 @@ std::string trim(const std::string& s);
 bool parse_int(const std::string& s, int& out);
 void reload_triggers();   // 重载软件同级 trigger.json（失败保留当前配置）
 void persist_triggers();  // 把内存配置原子写回 trigger.json（写前往返校验，失败保留内存配置）
+bool import_accept_trigger(const wsmud::trigger::Trigger& cand);  // 导入分享码触发器并归属当前角色
 void process_line(const std::string& raw);
 
 // tui_ui.cpp：全屏 TUI 状态机 + 渲染 + 运行循环

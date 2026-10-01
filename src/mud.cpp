@@ -345,9 +345,12 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
             const std::string wdy = revived ? "已经复活" : "已经死亡";
             enqueue_trig([this, wdy] { trig.on_die(wdy); });
         } else if (type == "dispfm") {
-            enqueue_trig([this, v] {
-                trig.on_dispfm(v.get("id").as_string(), v.get("rtime").as_string(),
-                               v.get("distime").as_string(), now_ms());
+            // rtime/distime 服务器下发为数字，必须用 val_str 而非 as_string（后者对数字返回空串，
+            // 会导致冷却时长恒为 0、冷却表立即过期，(:cd) 恒判 false）
+            const std::string rtime = val_str(v.get("rtime"));
+            const std::string distime = val_str(v.get("distime"));
+            enqueue_trig([this, v, rtime, distime] {
+                trig.on_dispfm(v.get("id").as_string(), rtime, distime, now_ms());
             });
         } else if (type == "sc") {
             trig_on_sc(v);
@@ -737,6 +740,93 @@ void Account::trig_on_social(const json::Value& v) {
     if (!v.get("items").is_null()) return;
     const std::string content = v.get("message").get("content").as_string();
     enqueue_trig([this, content] { trig.on_social(content); });
+}
+
+// ---------- 触发器分享码导入（云端下载） ----------
+
+// form-urlencoded 编码：token 中可能含中文/特殊字符，"·触发" 等需要转码
+std::string urlencode(const std::string& s) {
+    static const char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 15];
+        }
+    }
+    return out;
+}
+
+void Account::import_start(const std::string& token) {
+    import_data.clear();
+    import_err.clear();
+    // 分享码必须带"·触发"标记（与扩展 importTrigger 校验一致）
+    if (token.find("\xc2\xb7\xe8\xa7\xa6\xe5\x8f\x91") == std::string::npos &&
+        token.find("·触发") == std::string::npos) {
+        import_state = ImportState::Done;
+        import_err = "错误的触发器分享码（缺少 ·触发 标记）";
+        log("[导入] " + import_err);
+        return;
+    }
+    std::string body = "token=" + urlencode(token);
+    // 云端地址 wsmud.ii74.com 同时监听 http/https；HttpReq 仅支持明文 http
+    import_http.start("http://wsmud.ii74.com/S/downloadSingle", "POST", body, now_ms(),
+                      "application/x-www-form-urlencoded");
+    import_state = ImportState::Downloading;
+    import_deadline_ms = now_ms() + HTTP_TIMEOUT_MS;
+    log("[导入] 正在下载分享码...");
+}
+
+void Account::import_tick(int64_t now) {
+    if (import_state != ImportState::Downloading) return;
+    if (now > import_deadline_ms) {
+        import_http.close();
+        import_state = ImportState::Done;
+        import_err = "下载超时";
+        log("[导入失败] " + import_err);
+        return;
+    }
+    import_http.tick(now);   // 驱动 import_http 的网络进度（连接/发送/接收）；缺失则下载永不完成
+    if (!import_http.done()) return;
+    import_state = ImportState::Done;
+    if (import_http.state == net::HttpReq::State::Failed) {
+        import_err = import_http.error;
+        log("[导入失败] " + import_err);
+        return;
+    }
+    if (import_http.status != 200) {
+        import_err = "服务器返回 HTTP " + std::to_string(import_http.status);
+        log("[导入失败] " + import_err);
+        return;
+    }
+    // 解析 {code, data}；扩展约定 data 为可执行的 JS 字符串片段
+    std::string perr;
+    json::Value v = json::parse(import_http.body, &perr);
+    if (!perr.empty() || !v.is_object()) {
+        import_err = "分享码数据解析失败";
+        log("[导入失败] " + import_err);
+        return;
+    }
+    if (v.get("code").as_int() != 200) {
+        std::string hint = v.get("message").as_string("分享码无效");
+        import_err = v.get("msg").as_string(hint.c_str());
+        log("[导入失败] " + import_err);
+        return;
+    }
+    const json::Value& data = v.get("data");
+    if (data.is_string()) import_data = data.as_string();
+    else if (data.is_object()) import_data = json::dump(data);
+    if (import_data.empty()) {
+        import_err = "分享码无有效数据";
+        log("[导入失败] " + import_err);
+        return;
+    }
+    log("[导入] 分享码下载成功，等待确认...");
 }
 
 }  // namespace mud

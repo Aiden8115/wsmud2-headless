@@ -78,6 +78,9 @@ public:
     std::vector<Trigger> list() const;
     std::size_t count() const { return list().size(); }
 
+    // 解析分享码返回的触发器 JSON（{name,event,active,author,conditions,source}）到 out，
+    // 不落盘、不改引擎数据。TUI 导入预览确认用它生成待确认触发器（再设 owner 后持久化）。
+    static bool parse_share(const std::string& data_json, Trigger& out, std::string& err);
     // 导入分享码（云端返回的触发器 JSON 字符串，即 importTrigger 中 JSON.parse(data) 的输入）
     bool import(const std::string& data_json, std::string& err);
     // 开关（1-based 编号，与 F8 列表一致）

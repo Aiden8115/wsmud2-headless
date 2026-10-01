@@ -288,6 +288,43 @@ const char* cond_label_name(const std::string& key) {
     return key.c_str();
 }
 
+// 事件内部名 ← 中文标签反向匹配；找不到返回 nullptr。云端分享码的事件/条件键用中文标签，
+// 而引擎 fire/事件表用内部枚举名，导入前须转回内部名否则 find_event 匹配不到
+const EventDef* find_event_by_label(const std::string& label) {
+    for (int i = 0; i < N_EVENTS; ++i)
+        if (event_label_name(EVENTS[i].name) == label) return &EVENTS[i];
+    return nullptr;
+}
+
+// 条件键内部名 ← 中文说明反向匹配（也接受已是内部名）；返回 false 表示不属于该事件
+bool cond_key_to_internal(const EventDef* ev, const std::string& key, std::string& out_internal) {
+    for (int i = 0; i < ev->nfilters; ++i) {
+        if (ev->filters[i].name == key) { out_internal = key; return true; }
+        if (cond_label_name(ev->filters[i].name) == key) { out_internal = ev->filters[i].name; return true; }
+    }
+    // 扩展分享码用中文键名（如 改变类型/BuffId），与本程序内部键/中文标签用词不同，做别名反查
+    const char* alias = nullptr;
+    if (key == "改变类型") alias = "change_type";
+    else if (key == "BuffId") alias = "buff_id";
+    else if (key == "触发对象") alias = "target";
+    else if (key == "当") alias = "when";
+    else if (key == "值") alias = "value";
+    else if (key == "值类型") alias = "value_type";
+    else if (key == "技能id" || key == "技能") alias = "skill_id";
+    else if (key == "名称关键字" || key == "人名关键字") alias = "name_keyword";
+    else if (key == "物品等级") alias = "item_level";
+    else if (key == "关键字") alias = "keyword";
+    else if (key == "发言人") alias = "speaker";
+    else if (key == "忽略发言人") alias = "ignore_speaker";
+    else if (key == "人物名称") alias = "char_name";
+    else if (key == "类型") alias = "type";
+    if (alias) {
+        for (int i = 0; i < ev->nfilters; ++i)
+            if (ev->filters[i].name == alias) { out_internal = alias; return true; }
+    }
+    return false;
+}
+
 // 枚举候选（依事件给 type 键不同取值）；非枚举键返回空
 std::vector<std::string> cond_options(const std::string& event, const std::string& key) {
     std::vector<std::string> out;
@@ -296,7 +333,7 @@ std::vector<std::string> cond_options(const std::string& event, const std::strin
     else if (key == "change_type") { out = {"新增", "移除", "层数刷新"}; }
     else if (key == "target") { out = {"自己", "他人"}; }
     else if (key == "when") { out = {"低于", "高于"}; }
-    else if (key == "value_type") { out = {"百分比", "数值"}; }
+    else if (key == "value_type") out = {"百分比", "数值"};
     else if (key == "type") {
         if (event == "combat") out = {"进入战斗", "脱离战斗"};
         else if (event == "death") out = {"已经死亡", "已经复活"};
@@ -1039,29 +1076,44 @@ int64_t Engine::host_now() { return mono_ms(); }
 // 导入 / 开关 / 持久化
 // ============================================================
 
-bool Engine::import(const std::string& data_json, std::string& err) {
-    std::lock_guard<std::mutex> lk(list_mu_);
+bool Engine::parse_share(const std::string& data_json, Trigger& out, std::string& err) {
     std::string perr;
     json::Value v = json::parse(data_json, &perr);
     if (!perr.empty() || !v.is_object()) { err = "分享码数据解析失败"; return false; }
     std::string name = v.get("name").as_string();
     if (!name_ok(name)) { err = "触发器的名称只能使用中文、英文和数字字符。"; return false; }
-    for (const auto& t : triggers_)
-        if (t.name == name) { err = "无法修改名称，已经存在同名触发器！"; return false; }
     std::string event = v.get("event").as_string();
     if (event.empty()) { err = "触发器缺少事件类型"; return false; }
+    const EventDef* ev = find_event(event);
+    if (!ev) ev = find_event_by_label(event);   // 分享码事件名是中文标签，转内部枚举名
+    if (!ev) { err = "未知事件类型：" + event; return false; }
     Trigger tg;
     tg.name = name;
-    tg.event = event;
+    tg.event = ev->name;                         // 统一存内部枚举名，fire 才能命中
     tg.active = v.get("active").as_bool(false);
     tg.author = v.get("author").as_string();
     const json::Value& conds = v.get("conditions");
     if (conds.is_object()) {
-        for (const auto& kv : conds.as_object())
-            tg.conditions[kv.first] = val_str(kv.second);
+        for (const auto& kv : conds.as_object()) {
+            std::string internal;
+            if (!cond_key_to_internal(ev, kv.first, internal)) {
+                err = "触发器「" + name + "」的条件键「" + kv.first + "」不属于事件「" + event + "」"; return false;
+            }
+            tg.conditions[internal] = val_str(kv.second);
+        }
     }
     tg.source = v.get("source").as_string();
     if (tg.source.empty()) { err = "触发器缺少脚本源码"; return false; }
+    out = std::move(tg);
+    return true;
+}
+
+bool Engine::import(const std::string& data_json, std::string& err) {
+    std::lock_guard<std::mutex> lk(list_mu_);
+    Trigger tg;
+    if (!parse_share(data_json, tg, err)) return false;
+    for (const auto& t : triggers_)
+        if (t.name == tg.name) { err = "无法修改名称，已经存在同名触发器！"; return false; }
     triggers_.push_back(std::move(tg));
     save();
     return true;

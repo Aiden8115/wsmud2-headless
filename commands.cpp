@@ -144,6 +144,24 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
+// 导入分享码触发器的落库：归属到当前角色并原子写回 trigger.json。
+// 返回 false 表示未导入（同角色重名 / 未进入游戏）。
+bool import_accept_trigger(const wsmud::trigger::Trigger& cand) {
+    const auto& a = *accounts[static_cast<std::size_t>(sel)];
+    if (a.my_name.empty()) { out("[导入] 当前未进入游戏，无法确定归属角色"); return false; }
+    const std::string my = a.my_name;
+    for (const auto& t : g_trig_cfg)
+        if (t.owner == my && t.name == cand.name) {
+            out("[导入] 已存在同名触发器「" + cand.name + "」，已跳过");
+            return false;
+        }
+    wsmud::trigger::Trigger t = cand;
+    t.owner = my;
+    g_trig_cfg.push_back(std::move(t));
+    persist_triggers();
+    return true;
+}
+
 // 重新加载触发器：读 exe 同级 trigger.json，校验后替换所有账号的引擎。
 // 文件不存在时创建空模板（唯一写操作）。失败保留当前配置。
 void reload_triggers() {

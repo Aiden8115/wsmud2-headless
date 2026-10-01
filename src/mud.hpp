@@ -74,6 +74,13 @@ public:
     // 等待用户输入的类型
     enum class Need { None, Server, Role };
 
+    // 触发器分享码导入状态（复用账号内独立 import_http）
+    enum class ImportState { Idle, Downloading, Done };
+    ImportState import_state = ImportState::Idle;
+    std::string import_data;   // 下载完成的原始 JSON（Done 时有效）
+    std::string import_err;    // 失败原因
+    int64_t import_deadline_ms = 0;
+
     int index = 0;                 // 1-based 账号序号
     std::string account;           // 登录账号
     std::string password;          // 登录密码
@@ -90,8 +97,9 @@ public:
     std::vector<Role> roles;
     Role role;
 
-    net::HttpReq http;      // 登录/服务器列表的异步 HTTP 请求
-    ws::WsClient ws;        // 游戏 WebSocket 连接
+    net::HttpReq http;       // 登录/服务器列表的异步 HTTP 请求
+    net::HttpReq import_http; // 分享码下载的异步 HTTP 请求（独立，不与登录 http 争用）
+    ws::WsClient ws;          // 游戏 WebSocket 连接
 
     int64_t stage_deadline_ms = 0; // 当前阶段超时
     int64_t last_ping_ms = 0;      // 上次发 ping 时间
@@ -118,6 +126,9 @@ public:
     void select_role(int idx);
     // 主循环驱动
     void tick(int64_t now);
+    // 触发器分享码导入：发起下载 / 主循环驱动，下载完成后 import_state=Done
+    void import_start(const std::string& token);
+    void import_tick(int64_t now);
     // 发送游戏命令（仅 Online 有效）
     bool send_command(const std::string& cmd);
     // 手动重连（沿用内存中的账号密码与服务器/角色）

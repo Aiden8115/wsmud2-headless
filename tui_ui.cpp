@@ -30,6 +30,20 @@ bool handle_source_byte_ns(unsigned char c, EscState& es);   // source 多行编
 void source_open();      // focus 到 source 行按 Enter → 打开全屏多行编辑器
 void source_save_return();  // 保存 source 缓冲并退回表单
 
+// ---------- 触发器分享码导入状态（F8 列表按 i 输入分享码 → 下载 → 预览 y/n 确认） ----------
+void open_import_input();              // 进入行内分享码输入
+void import_begin();                   // 行内输入回车 → 发起下载
+void import_confirm_key(unsigned char c);  // 预览确认屏 y=导入/信任执行 n=跳过
+void close_import();                   // 复位导入状态
+bool import_has_exec(const std::string& s);  // 源码是否含 @js/#js 可执行脚本
+
+bool imp_editing = false;    // 正在行内输入分享码
+std::string imp_buf;         // 行内分享码缓冲
+bool imp_confirm = false;    // 预览确认中（下载完成的触发器待 y/n）
+wsmud::trigger::Trigger imp_cand;  // 待确认触发器
+int imp_stage = 0;           // 0=导入确认  1=含可执行脚本时的二次信任确认
+bool imp_js_extra = false;   // 源码含 @js/#js → 需二次 y/n
+
 int fn_from_digits(const char* b, int n) {
     int v = 0;
     for (int i = 0; i < n; ++i) v = v * 10 + (b[i] - '0');
@@ -66,6 +80,17 @@ bool handle_byte(unsigned char c, EscState& es) {
         case 0:
             if (c == 0x1b) { es.st = 1; return false; }
             if (c == 0x03) { quitting = true; return true; }   // Ctrl+C
+            // ---------- 触发器分享码导入：预览确认 / 行内分享码输入 ----------
+            if (view == View::TrigList && imp_confirm) {
+                if (c == 'y' || c == 'Y' || c == 'n' || c == 'N') { import_confirm_key(c); return false; }
+                return false;
+            }
+            if (view == View::TrigList && imp_editing) {
+                if (c == '\r' || c == '\n') { import_begin(); return false; }
+                if (c == 0x7f || c == 0x08) { backspace_utf8(imp_buf); return false; }
+                if (c >= 0x20) imp_buf += static_cast<char>(c);
+                return false;
+            }
             // ---------- 触发器列表视图：快捷键不进命令框 ----------
             if (view == View::TrigList) {
                 if (c == '\r' || c == '\n') { if (cmd_buf.empty()) leader_edit(); else submit(); return false; }
@@ -550,6 +575,54 @@ void leader_key(unsigned char c) {
     if (c == 'a' || c == 'A') { leader_new(); return; }
     if (c == ' ' || c == 't' || c == 'T') { leader_toggle(); return; }
     if (c == 'e' || c == 'E') { leader_edit(); return; }
+    if (c == 'i' || c == 'I') { open_import_input(); return; }
+}
+
+// ---------- 触发器分享码导入（i → 行内输入 → 下载 → 预览 y/n 确认） ----------
+
+bool import_has_exec(const std::string& s) {
+    if (s.find("@js") != std::string::npos) return true;
+    if (s.find("#js") != std::string::npos) return true;
+    return false;
+}
+
+void open_import_input() {
+    imp_editing = true;
+    imp_buf.clear();
+}
+void close_import() {
+    imp_editing = false;
+    imp_confirm = false;
+    imp_buf.clear();
+    imp_stage = 0;
+    imp_js_extra = false;
+    imp_cand = wsmud::trigger::Trigger();
+}
+
+void import_begin() {
+    int idx = accounts[static_cast<std::size_t>(sel)]->index;
+    std::string code = trim(imp_buf);
+    imp_buf.clear();
+    imp_editing = false;
+    if (code.empty()) { account_log(idx, "[导入] 分享码为空，已取消"); return; }
+    accounts[static_cast<std::size_t>(sel)]->import_start(code);
+}
+
+void import_confirm_key(unsigned char c) {
+    auto& a = *accounts[static_cast<std::size_t>(sel)];
+    int idx = a.index;
+    bool yes = (c == 'y' || c == 'Y');
+    if (!yes) {
+        account_log(idx, "[导入] 已跳过「" + imp_cand.name + "」，不导入");
+        close_import();
+        return;
+    }
+    // 含 @js/#js：第一次 y 只确认导入，二次 y 才信任执行
+    if (imp_js_extra && imp_stage == 0) { imp_stage = 1; return; }
+    if (import_accept_trigger(imp_cand)) {
+        account_log(idx, "[导入] 已导入「" + imp_cand.name + "」并归属角色 " + a.my_name);
+    }
+    close_import();
 }
 
 // ---------- 渲染（全屏模式） ----------
@@ -631,11 +704,42 @@ void render() {
                 for (int r = 0; r < editor_rows(); ++r)
                     f.list_lines.push_back(editor_line_text(r));
             }
+        } else if (imp_editing) {
+            f.list_cursor = -1;
+            f.list_title = "账号" + std::to_string(sel + 1) +
+                " 粘贴/输入触发器分享码（含·触发）→ Enter 下载 · Esc 取消";
+            f.list_lines.clear();
+            f.list_lines.push_back(fit("分享码> " + (imp_buf.empty() ? "（空）" : imp_buf),
+                static_cast<std::size_t>(t.cols - 2), false));
+            f.list_lines.push_back("");
+            f.list_lines.push_back("说明：粘贴完整分享码后按 Enter 下载，将逐条预览并 y/n 确认后导入");
+        } else if (imp_confirm) {
+            f.list_cursor = -1;
+            const auto& a = *accounts[static_cast<std::size_t>(sel)];
+            const auto& cd = imp_cand;
+            f.list_title = "账号" + std::to_string(sel + 1) + " 确认导入触发器（y 导入 · n 跳过）";
+            f.list_lines.clear();
+            f.list_lines.push_back("名称: " + cd.name);
+            f.list_lines.push_back("事件: " + std::string(wsmud::trigger::Engine::event_label(cd.event)) +
+                "  <" + cd.event + ">");
+            f.list_lines.push_back("归属: " + (a.my_name.empty() ? "（未进入游戏）" : a.my_name));
+            for (const auto& kv : cd.conditions)
+                f.list_lines.push_back("条件  " + kv.first + " = " + (kv.second.empty() ? "（通配）" : kv.second));
+            f.list_lines.push_back("脚本:");
+            std::string src = cd.source;
+            if (src.find('\n') != std::string::npos)
+                src = src.substr(0, src.find('\n')) + " …";
+            f.list_lines.push_back("  " + (src.empty() ? "（无脚本）" : src));
+            if (imp_js_extra)
+                f.list_lines.push_back("⚠ 脚本含 @js/#js 可执行代码，需二次确认信任执行");
+            f.list_lines.push_back(imp_js_extra && imp_stage == 1
+                ? "确认要执行脚本中的原生代码吗？ y 信任并导入 / n 取消"
+                : "确认导入该触发器吗？ y 导入 / n 跳过");
         } else {
         // list_lines[0] 是提示行，触发器 #i 在 list_lines[i+1]；
         // 反色高亮必须 +1，否则落在选中触发器上方一行
         f.list_cursor = list_cursor + 1;
-        f.list_title = "账号" + std::to_string(sel + 1) + " 触发器列表（F8 编辑 · 空格开关 · d 删除 · a 新增 · Esc 返回）";
+        f.list_title = "账号" + std::to_string(sel + 1) + " 触发器列表（F8 编辑 · 空格开关 · d 删除 · a 新增 · i 导入 · Esc 返回）";
         const auto& tl = accounts[static_cast<std::size_t>(sel)]->trig.list();
         f.list_lines.clear();
         f.list_lines.push_back("trigger list 查看 · reloadTrigger 重载");
@@ -865,7 +969,7 @@ void handle_fn(int fn) {  // fn: 1-12
 // ---------- 触发器界面：只读列表（配置由 trigger.json 维护） ----------
 
 void open_list() { view = View::TrigList; trig_view = true; list_cursor = 0; cmd_buf.clear(); scroll_offset = 0; chat_scroll_offset = 0; refresh_input_state(); }
-void close_list() { view = View::Logs; trig_view = false; cmd_buf.clear(); scroll_offset = 0; chat_scroll_offset = 0; g_del_arm = false; refresh_input_state(); }
+void close_list() { view = View::Logs; trig_view = false; cmd_buf.clear(); scroll_offset = 0; chat_scroll_offset = 0; g_del_arm = false; close_import(); refresh_input_state(); }
 
 // 点击处理（鼠标）：顶栏切槽位 / 列表 [返回] 按钮
 void handle_click(int x, int y) {
@@ -959,6 +1063,27 @@ void tui_run_loop() {
 
         for (auto& a : accounts) a->tick(now);
         for (auto& a : accounts) a->drain_trig_main();   // 排空 worker 回传的 send/log 闭包
+        // 触发器分享码导入推进（当前账号）：下载 → 完成后转入预览确认
+        {
+            auto& a = *accounts[static_cast<std::size_t>(sel)];
+            if (a.import_state == Account::ImportState::Downloading) a.import_tick(now);
+            if (view == View::TrigList && !imp_editing && !imp_confirm &&
+                a.import_state == Account::ImportState::Done) {
+                if (a.import_err.empty()) {   // mud.cpp 已就失败写过日志
+                    wsmud::trigger::Trigger cand;
+                    std::string err;
+                    if (wsmud::trigger::Engine::parse_share(a.import_data, cand, err)) {
+                        imp_cand = std::move(cand);
+                        imp_confirm = true;
+                        imp_stage = 0;
+                        imp_js_extra = import_has_exec(imp_cand.source);
+                    } else {
+                        account_log(a.index, "[导入失败] " + err);
+                    }
+                }
+                a.import_state = Account::ImportState::Idle;
+            }
+        }
         // 登录失败（如密码错误）：自动回退到该槽位的账号/密码录入阶段，避免卡死
         for (auto& a : accounts) {
             if (a->stage == Account::Stage::Disconnected &&

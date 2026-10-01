@@ -131,6 +131,13 @@ function presetValue(name, arg) {
         if (arg !== undefined) return String(getState().stateRaw).indexOf(String(arg)) != -1;
         return getState().stateNorm;
     }
+    // (:cd skill)：技能是否处于冷却（布尔，与扩展 Role.coolingSkill 一致）。
+    // 缺失时 (…cd…)==false 恒成立，导致 if 分支恒选、else-if 分支永不触发。
+    if (name == 'cd') {
+        var sid = String(arg != null ? arg : '');
+        var until = __cxx.coolingUntil(sid);
+        return until ? until > __cxx.now() : false;
+    }
     var base = presetRaw(name);
     if (arg !== undefined) return String(base == null ? '' : base).indexOf(String(arg)) != -1;
     return base;
@@ -262,9 +269,10 @@ function parseBody(lines, i, controlIndent) {
     while (i < lines.length) {
         var ln = lines[i];
         if (ln.ind <= controlIndent) {
-            var m = /^\[(else|elseif)\]\s*(.*)$/.exec(ln.text);
+            var m = /^\[(else|elseif|else if)\]\s*(.*)$/.exec(ln.text);
             if (m && ln.ind == controlIndent) {
-                if (m[1] == 'else') { i++; elseOps = []; cur = elseOps; continue; }
+                // 纯 [else]（无条件）开辟无条件 else 分支；[elseif]/[else if]/带条件的 else 视为嵌套 if 挂进 else 列表
+                if (m[1] == 'else' && m[2].trim() == '') { i++; elseOps = []; cur = elseOps; continue; }
                 var cond = m[2], i2 = i + 1;
                 var sub = parseBody(lines, i2, controlIndent);
                 if (elseOps == null) elseOps = [];
@@ -287,7 +295,7 @@ function parseStatement(lines, i) {
     var text = ln.text;
     var ind = ln.ind;
     if (text[0] == '[') {
-        var m = /^\[(if|while|elseif|else|exit|break|continue)\]\s*(.*)$/.exec(text);
+        var m = /^\[(if|while|elseif|else if|else|exit|break|continue)\]\s*(.*)$/.exec(text);
         if (m && (m[1] == 'if' || m[1] == 'while')) {
             var kw = m[1], cond = m[2];
             var body = parseBody(lines, i + 1, ind);
@@ -296,7 +304,7 @@ function parseStatement(lines, i) {
         if (m && m[1] == 'exit') return { ops: [{ t: 'exit' }], next: i + 1 };
         if (m && m[1] == 'break') return { ops: [{ t: 'break' }], next: i + 1 };
         if (m && m[1] == 'continue') return { ops: [{ t: 'continue' }], next: i + 1 };
-        if (m) return { ops: [], next: i + 1 };   // 悬挂的 else/elseif，跳过
+        if (m) return { ops: [], next: i + 1 };   // 悬挂的 else/elseif/else if，跳过不当作命令
         if (text.indexOf('[=') == 0) {
             var close = text.indexOf(']');
             if (close > 1) {
@@ -470,6 +478,8 @@ function waitDone(flow) {
                 if (u && u > now) return false;
             }
             return true;
+        case 'perform':
+            return performDone(flow, w, now);
     }
     return true;
 }
@@ -481,6 +491,22 @@ function sendQueueDone(flow, now) {
         flow.lastCmdMs = now;
     }
     return flow.sendQueue.length == 0;
+}
+
+// @perform：逐个技能等待冷却结束后再释放。第一个仍在冷却则整队等待；
+// 超时仍未冷却好则强制释放剩余技能，避免卡死整个流程。
+function performDone(flow, w, now) {
+    if (now >= w.deadline) {
+        __cxx.log('[提示] @perform 等待冷却超时，继续');
+        while (w.skills.length) __cxx.send('perform ' + w.skills.shift());
+        return true;
+    }
+    while (w.skills.length) {
+        var u = __cxx.coolingUntil(w.skills[0]);
+        if (u && u > now) return false;
+        __cxx.send('perform ' + w.skills.shift());
+    }
+    return true;
 }
 
 function killDone(flow, w, now) {
@@ -560,6 +586,13 @@ function doCd(flow, args) {
     flow.wait = { t: 'cd', skills: skills, deadline: __cxx.now() + 60000 };
 }
 
+function doPerform(flow, args) {
+    var list = String(resolvePlaceholders(args)).split(',')
+        .map(function (s) { return s.trim(); }).filter(Boolean);
+    if (!list.length) return;
+    flow.wait = { t: 'perform', skills: list, deadline: __cxx.now() + 60000 };
+}
+
 function doJs(flow, args) {
     var m = /^\(\$([A-Za-z0-9_]+)\)\s*=\s*([\s\S]+)$/.exec(String(args));
     if (m) { flow.vars[m[1]] = evalExpr(m[2], flow); return; }
@@ -625,8 +658,7 @@ function execCmd(flow, text) {
             doKill(flow, resolvePlaceholders(args));
             return;
         case 'perform':
-            args.split(',').map(function (s) { return s.trim(); }).filter(Boolean)
-                .forEach(function (s) { __cxx.send('perform ' + s); });
+            doPerform(flow, args);
             return;
         case 'renew':
             doRenew(flow);
