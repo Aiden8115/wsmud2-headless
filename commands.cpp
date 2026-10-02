@@ -6,6 +6,11 @@
 #include <utility>     // std::move
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>   // 原生 Windows 构建：直接用 Win32 剪贴板 API
+#include <cstring>     // memcpy/memset
+#endif
+
 #include "app.hpp"
 
 namespace {
@@ -59,10 +64,10 @@ void cmd_status() {
 }
 
 void cmd_help() {
-    out("程序命令：status / reconnect [N|all] / send <N> <命令> / reloadTrigger / quit（退出当前槽位账号）/ help");
+    out("程序命令：status / reconnect [N|all] / send <N> <命令> / reloadTrigger / copyId <N>（复制房间第 N 个人物的 ID）/ quit（退出当前槽位账号）/ help");
     out("触发器：trigger list 查看；F8 列表内 a/e/空格/d 可直接增删改并原子写回 trigger.json，也可改文件后 reloadTrigger 重载");
     out("按键：F1-F5 选中槽位 | ←→ 切换标签页 | ↑↓ 滚动日志 | F6 切换命令/游戏命令 | "
-        "F7 新增标签页 | F8 触发器列表 | DEL 删除当前标签页（仅序号>5） | F10 退出程序");
+        "F7 新增标签页 | F8 触发器列表 | F9 设置（自动施法/自动喜宴，按玩家） | DEL 删除当前标签页（仅序号>5） | F10 退出程序");
 }
 
 void cmd_reconnect(const std::string& arg) {
@@ -106,6 +111,136 @@ void cmd_trigger(const std::string& arg) {
         return;
     }
     out("用法：trigger list");
+}
+
+// ---------- copyId：把房间人物的 ID 复制到系统剪贴板 ----------
+
+// Base64（RFC4648 标准表 + '=' 填充），供 OSC 52 剪贴板序列使用
+std::string base64(const std::string& s) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    std::size_t i = 0;
+    while (i + 3 <= s.size()) {
+        unsigned v = (static_cast<unsigned char>(s[i]) << 16) |
+                     (static_cast<unsigned char>(s[i + 1]) << 8) |
+                     static_cast<unsigned char>(s[i + 2]);
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63];
+        out += T[(v >> 6) & 63];  out += T[v & 63];
+        i += 3;
+    }
+    std::size_t rem = s.size() - i;
+    if (rem == 1) {
+        unsigned v = static_cast<unsigned char>(s[i]) << 16;
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63]; out += "==";
+    } else if (rem == 2) {
+        unsigned v = (static_cast<unsigned char>(s[i]) << 16) |
+                     static_cast<unsigned char>(s[i + 1]) << 8;
+        out += T[(v >> 18) & 63]; out += T[(v >> 12) & 63]; out += T[(v >> 6) & 63]; out += '=';
+    }
+    return out;
+}
+
+// UTF-8 → UTF-16LE。Windows 的 clip.exe 按 CF_UNICODETEXT 读取 stdin，
+// 直接送 UTF-8 字节会把中文等非 ASCII 变成乱码，故必须先转换。
+std::string utf8_to_utf16le(const std::string& s) {
+    std::string out;
+    auto put = [&](unsigned u) {
+        out.push_back(static_cast<char>(u & 0xFF));
+        out.push_back(static_cast<char>((u >> 8) & 0xFF));
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        std::size_t n = 1;
+        std::uint32_t cp = c;
+        if (c >= 0xF0) { n = 4; cp = c & 0x07u; }
+        else if (c >= 0xE0) { n = 3; cp = c & 0x0Fu; }
+        else if (c >= 0xC0) { n = 2; cp = c & 0x1Fu; }
+        if (i + n > s.size()) { n = 1; cp = c; }   // 截断的残缺序列：按单字节兜底
+        for (std::size_t k = 1; k < n; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3Fu);
+        i += n;
+        if (cp <= 0xFFFF) {
+            put(cp);
+        } else {                                   // 补充平面 → UTF-16 代理对
+            cp -= 0x10000;
+            put(0xD800 + (cp >> 10));
+            put(0xDC00 + (cp & 0x3FF));
+        }
+    }
+    return out;
+}
+
+// 把文本送进 Windows 剪贴板。
+// 两种构建各走一条通路：
+//   _WIN32（MinGW 原生 Windows）：直接调 Win32 剪贴板 API，不依赖终端、也不依赖 clip.exe；
+//   非 Windows（WSL/Linux）：调 Windows 侧的 clip.exe（WSL 互操作），路径不存在则返回 false，
+//   由调用方回退到 OSC 52 交给终端处理。
+#ifdef _WIN32
+bool copy_to_windows_clipboard(const std::string& text) {
+    const std::string u16 = utf8_to_utf16le(text);   // UTF-16LE 字节流
+    if (!::OpenClipboard(nullptr)) return false;
+    bool ok = false;
+    if (::EmptyClipboard()) {
+        const SIZE_T bytes = u16.size() + 2;         // +2 字节：末尾 UTF-16 NUL
+        HGLOBAL h = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (h) {
+            void* dst = ::GlobalLock(h);
+            if (dst) {
+                std::memcpy(dst, u16.data(), u16.size());
+                std::memset(static_cast<char*>(dst) + u16.size(), 0, 2);
+                ::GlobalUnlock(h);
+                // SetClipboardData 成功后所有权归系统，不得再 GlobalFree
+                if (::SetClipboardData(CF_UNICODETEXT, h)) ok = true;
+            }
+            if (!ok) ::GlobalFree(h);
+        }
+    }
+    ::CloseClipboard();
+    return ok;
+}
+#else
+bool copy_to_windows_clipboard(const std::string& text) {
+    const char* clip = "/mnt/c/Windows/System32/clip.exe";
+    if (::access(clip, X_OK) != 0) return false;
+    // popen 的 "w" 会把子进程 stdin 接到管道上（不会抢走终端的输入）；
+    // 2>/dev/null 避免失败信息打到 TUI 画面上
+    FILE* p = ::popen((std::string(clip) + " 2>/dev/null").c_str(), "w");
+    if (!p) return false;
+    const std::string u16 = utf8_to_utf16le(text);
+    bool ok = std::fwrite(u16.data(), 1, u16.size(), p) == u16.size();
+    if (::pclose(p) != 0) ok = false;
+    return ok;
+}
+#endif
+
+// copyId <N>：复制房间人物列表第 N 个人的 ID（N 从 1 开始，按房间区的显示顺序）。
+// 房间区只显示 5 行，但 N 可大于 5 —— 只要该人物还在列表中就能准确复制。
+void cmd_copy_id(const std::string& arg) {
+    auto& a = *accounts[static_cast<std::size_t>(sel)];
+    int n = 0;
+    if (!parse_int(trim(arg), n) || n < 1) {
+        out("用法：copyId <序号>，如 copyId 1（复制房间第 1 个人物的 ID）");
+        return;
+    }
+    const auto& ppl = a.my_room_people;
+    if (static_cast<std::size_t>(n) > ppl.size()) {
+        out("房间人物只有 " + std::to_string(ppl.size()) + " 个，序号 " + std::to_string(n) + " 超出范围");
+        return;
+    }
+    // 与房间区显示顺序一致：第 N 个人 = 列表中倒数第 N 个
+    const auto& p = ppl[ppl.size() - static_cast<std::size_t>(n)];
+    if (p.first.empty()) { out("第 " + std::to_string(n) + " 个人物没有可用 ID"); return; }
+    // 优先写 Windows 剪贴板（WSL 下由 clip.exe 完成，与终端是否支持 OSC 52 无关）；
+    // 非 WSL 环境退回 OSC 52，交给终端把 base64 解出后写它所在系统的剪贴板。
+    if (copy_to_windows_clipboard(p.first)) {
+        out("已复制第 " + std::to_string(n) + " 个人物的 ID：" + p.first + "（Windows 剪贴板）");
+        return;
+    }
+    const std::string seq = "\x1b]52;c;" + base64(p.first) + "\x07";
+    std::fwrite(seq.data(), 1, seq.size(), stdout);
+    std::fflush(stdout);
+    out("已复制第 " + std::to_string(n) + " 个人物的 ID：" + p.first +
+        "（OSC 52，终端需支持）");
 }
 
 }  // namespace
@@ -214,6 +349,64 @@ void persist_triggers() {
     out("已保存 " + std::to_string(g_trig_cfg.size()) + " 个触发器（trigger.json）");
 }
 
+// ---------- settings.json 加载/写回（按玩家隔离的本地设置，长期存储） ----------
+// 结构：{"version":1,"players":{"<角色名>":{"auto_perform":bool,"auto_marry":bool}}}
+// 与 trigger.json 同目录（软件同级）。文件不存在时创建空模板；解析失败保留空表。
+
+void load_settings() {
+    std::string path = exe_dir() + "/settings.json";
+    mud::g_settings.clear();
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) {
+        FILE* w = std::fopen(path.c_str(), "wb");
+        if (w) {
+            const char tmpl[] = "{\"version\":1,\"players\":{}}\n";
+            std::fwrite(tmpl, 1, sizeof tmpl - 1, w);
+            std::fclose(w);
+        }
+        out("settings.json 不存在，已创建空模板");
+        return;
+    }
+    std::string text;
+    char buf[4096];
+    std::size_t n;
+    while ((n = std::fread(buf, 1, sizeof buf, fp)) > 0) text.append(buf, n);
+    std::fclose(fp);
+    std::string err;
+    json::Value root = json::parse(text, &err);
+    if (!err.empty()) {
+        out("[设置] settings.json 解析失败：" + err + "（使用默认设置）");
+        return;
+    }
+    const auto& players = root.get("players");
+    if (!players.is_object()) return;
+    for (const auto& kv : players.as_object()) {
+        mud::PlayerSettings ps;
+        ps.auto_perform = kv.second.get("auto_perform").as_bool(false);
+        ps.auto_marry = kv.second.get("auto_marry").as_bool(false);
+        mud::g_settings[kv.first] = ps;
+    }
+    out("已加载 " + std::to_string(mud::g_settings.size()) + " 个玩家的设置（settings.json）");
+}
+
+// 把内存设置表原子写回 settings.json（临时文件 + rename，崩溃不损坏原文件）
+void persist_settings() {
+    json::Value::Object players;
+    for (const auto& kv : mud::g_settings) {
+        json::Value::Object po;
+        po["auto_perform"] = json::Value(kv.second.auto_perform);
+        po["auto_marry"] = json::Value(kv.second.auto_marry);
+        players[kv.first] = json::Value(std::move(po));
+    }
+    json::Value::Object root;
+    root["version"] = json::Value(1);
+    root["players"] = json::Value(std::move(players));
+    std::string text = json::dump_pretty(json::Value(std::move(root)));
+    std::string err;
+    if (!write_atomic(exe_dir() + "/settings.json", text, err))
+        out("[设置] 保存失败：" + err);
+}
+
 // 处理程序命令（一行）
 void process_line(const std::string& raw) {
     std::string line = trim(raw);
@@ -274,6 +467,10 @@ void process_line(const std::string& raw) {
     }
     if (line == "trigger" || line.rfind("trigger ", 0) == 0) {
         cmd_trigger(trim(line.substr(7)));
+        return;
+    }
+    if (line == "copyId" || line.rfind("copyId ", 0) == 0) {
+        cmd_copy_id(trim(line.substr(6)));
         return;
     }
     out("未知命令：" + line + "（输入 help 查看帮助）");

@@ -41,7 +41,7 @@ extern InputStage input_stage;
 extern bool trig_view;
 extern int list_cursor;               // 列表视图键盘高亮行（0=首条触发器）
 
-enum class View { Logs, TrigList };
+enum class View { Logs, TrigList, Settings };
 extern View view;
 
 // 点击区域（render 每帧重建，鼠标点击时匹配）
@@ -77,6 +77,9 @@ extern TrigEditor trig_editor;
 // 当前生效的全局触发器配置（来自软件同级目录 trigger.json，程序只读不写）
 extern std::vector<wsmud::trigger::Trigger> g_trig_cfg;
 
+// F9 设置屏：焦点设置项（0=自动施法 1=自动喜宴）
+extern int settings_cursor;
+
 // ---------- 函数（按所在编译单元分组） ----------
 
 // main.cpp：输出层
@@ -93,6 +96,8 @@ std::string trim(const std::string& s);
 bool parse_int(const std::string& s, int& out);
 void reload_triggers();   // 重载软件同级 trigger.json（失败保留当前配置）
 void persist_triggers();  // 把内存配置原子写回 trigger.json（写前往返校验，失败保留内存配置）
+void load_settings();     // 加载软件同级 settings.json（不存在则创建空模板）
+void persist_settings();  // 把玩家设置表原子写回 settings.json
 bool import_accept_trigger(const wsmud::trigger::Trigger& cand);  // 导入分享码触发器并归属当前角色
 void process_line(const std::string& raw);
 
@@ -108,6 +113,10 @@ bool chat_scroll(bool up);
 void handle_fn(int fn);   // fn: 1-12
 void open_list();
 void close_list();
+void open_settings();   // F9：打开设置屏（仅对已登录玩家开放）
+void close_settings();  // 关闭设置屏，回到日志视图
+void settings_move(int d);     // ↑↓：移动设置项焦点
+void settings_toggle();        // Enter/空格：切换当前设置项并写回 settings.json
 void handle_click(int x, int y);
 std::string trig_line_text(int num, const std::string& name, bool active, const std::string& ev, int cols);
 void tui_run_loop();

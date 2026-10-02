@@ -80,6 +80,11 @@ bool handle_byte(unsigned char c, EscState& es) {
         case 0:
             if (c == 0x1b) { es.st = 1; return false; }
             if (c == 0x03) { quitting = true; return true; }   // Ctrl+C
+            // ---------- F9 设置屏：↑↓ 移动焦点（case 2），Enter/空格 切换 ----------
+            if (view == View::Settings) {
+                if (c == '\r' || c == '\n' || c == ' ') { settings_toggle(); return false; }
+                return false;
+            }
             // ---------- 触发器分享码导入：预览确认 / 行内分享码输入 ----------
             if (view == View::TrigList && imp_confirm) {
                 if (c == 'y' || c == 'Y' || c == 'n' || c == 'N') { import_confirm_key(c); return false; }
@@ -107,6 +112,7 @@ bool handle_byte(unsigned char c, EscState& es) {
             if (c == 'O') { es.st = 3; return false; }
             es.st = 0;
             if (view == View::TrigList) close_list();   // 单独 Esc：关闭触发器列表
+            else if (view == View::Settings) close_settings();   // 单独 Esc：关闭设置屏
             return false;
         case 2:
             if (c == '<') {  // SGR 鼠标序列引导符
@@ -664,8 +670,11 @@ void render() {
         f.room_exits = cur.my_room_exits;
         const auto& ppl = cur.my_room_people;
         std::size_t take = ppl.size() < 5 ? ppl.size() : 5;
-        for (std::size_t k = 0; k < take; ++k)
-            f.room_people.push_back(ppl[ppl.size() - 1 - k].second);
+        for (std::size_t k = 0; k < take; ++k) {
+            const auto& p = ppl[ppl.size() - 1 - k];
+            // 名字后附该人物的 ID（copyId <序号> 复制的就是它）
+            f.room_people.push_back(p.first.empty() ? p.second : p.second + " (" + p.first + ")");
+        }
     }
     // 点击区域：顶栏槽位（所有视图都可用）
     g_zones.clear();
@@ -770,6 +779,19 @@ void render() {
         f.list_lines.push_back(fit("[返回]", static_cast<std::size_t>(t.cols - 2), false));
         g_zones.push_back({2, by, t.cols - 1, by, 5, 0});
         }
+    } else if (view == View::Settings) {
+        // ---- F9 设置屏：每行一个开关项（反色高亮焦点行，+1 偏移提示行） ----
+        f.list_view = true;
+        f.list_cursor = settings_cursor + 1;
+        const Account& a = *accounts[static_cast<std::size_t>(sel)];
+        f.list_title = "账号" + std::to_string(sel + 1) + "（" + a.my_name +
+            "）设置（↑↓ 选择 · Enter/空格 开关 · Esc 返回）";
+        f.list_lines.clear();
+        f.list_lines.push_back("设置长期保存于 settings.json（按玩家隔离）");
+        f.list_lines.push_back(std::string("自动施法：") + (a.auto_perform ? "开" : "关") +
+            "（战斗中智能释放技能）");
+        f.list_lines.push_back(std::string("自动喜宴：") + (a.auto_marry ? "开" : "关") +
+            "（活动喜宴自动领取）");
     }
     switch (input_stage) {
         case InputStage::Account: f.cmd_prompt = "账号" + std::to_string(sel + 1); break;
@@ -830,6 +852,11 @@ void select_slot(int n) {  // 0-based
     if (view == View::TrigList) {
         const Account& a = *accounts[static_cast<std::size_t>(sel)];
         if (a.stage != Account::Stage::Online) close_list();
+    }
+    // 设置屏同样是玩家级的：切到未进入游戏的槽位时退出，避免读写空玩家名的设置
+    if (view == View::Settings) {
+        const Account& a = *accounts[static_cast<std::size_t>(sel)];
+        if (a.stage != Account::Stage::Online) close_settings();
     }
     refresh_input_state();
 }
@@ -928,6 +955,7 @@ void del_tab() {
 
 // 列表/日志视图的上下移动（↑↓ 键）
 bool dir_up() {
+    if (view == View::Settings) { settings_move(-1); return false; }   // 设置屏：焦点上移
     if (view == View::TrigList) {
         if (list_cursor > 0) --list_cursor;
         return false;
@@ -936,6 +964,7 @@ bool dir_up() {
     return false;
 }
 bool dir_down() {
+    if (view == View::Settings) { settings_move(1); return false; }    // 设置屏：焦点下移
     if (view == View::TrigList) {
         std::size_t n = accounts[static_cast<std::size_t>(sel)]->trig.list().size();
         if (n > 0 && static_cast<std::size_t>(list_cursor) < n - 1) ++list_cursor;
@@ -977,6 +1006,16 @@ void handle_fn(int fn) {  // fn: 1-12
         }
         return;
     }
+    if (fn == 9) {  // F9 设置屏：开关（自动施法 / 自动喜宴，按玩家）
+        if (view == View::Settings) { close_settings(); return; }
+        const Account& a = *accounts[static_cast<std::size_t>(sel)];
+        if (a.stage != Account::Stage::Online) {
+            out("设置界面仅对已登录玩家开放：当前槽位未进入游戏，无法读取玩家设置");
+            return;
+        }
+        open_settings();
+        return;
+    }
     if (fn == 10) { quitting = true; return; }
 }
 
@@ -984,6 +1023,45 @@ void handle_fn(int fn) {  // fn: 1-12
 
 void open_list() { view = View::TrigList; trig_view = true; list_cursor = 0; cmd_buf.clear(); scroll_offset = 0; chat_scroll_offset = 0; refresh_input_state(); }
 void close_list() { view = View::Logs; trig_view = false; cmd_buf.clear(); scroll_offset = 0; chat_scroll_offset = 0; g_del_arm = false; close_import(); refresh_input_state(); }
+
+// ---------- F9 设置屏（按玩家持久化于 settings.json） ----------
+constexpr int SETTINGS_N = 2;   // 0=自动施法 1=自动喜宴
+
+void settings_move(int d) {
+    settings_cursor += d;
+    if (settings_cursor < 0) settings_cursor = 0;
+    if (settings_cursor > SETTINGS_N - 1) settings_cursor = SETTINGS_N - 1;
+}
+
+void settings_toggle() {
+    Account& a = *accounts[static_cast<std::size_t>(sel)];
+    if (a.my_name.empty()) { out("未进入游戏，无法修改玩家设置"); return; }
+    if (settings_cursor == 0) {
+        a.set_auto_perform(!a.auto_perform);
+        wsmud::mud::g_settings[a.my_name].auto_perform = a.auto_perform;
+    } else {
+        a.set_auto_marry(!a.auto_marry);
+        wsmud::mud::g_settings[a.my_name].auto_marry = a.auto_marry;
+    }
+    persist_settings();
+}
+
+void open_settings() {
+    view = View::Settings;
+    trig_view = false;
+    settings_cursor = 0;
+    cmd_buf.clear();
+    scroll_offset = 0;
+    chat_scroll_offset = 0;
+    refresh_input_state();
+}
+void close_settings() {
+    view = View::Logs;
+    cmd_buf.clear();
+    scroll_offset = 0;
+    chat_scroll_offset = 0;
+    refresh_input_state();
+}
 
 // 点击处理（鼠标）：顶栏切槽位 / 列表 [返回] 按钮
 void handle_click(int x, int y) {

@@ -148,7 +148,7 @@ std::size_t char_width_at(const std::string& s, std::size_t pos, std::size_t& ad
 
 Term detect() {
     Term t;
-    struct winsize ws;
+    struct winsize ws{};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
         t.rows = static_cast<int>(ws.ws_row);
         t.cols = static_cast<int>(ws.ws_col);
@@ -160,7 +160,7 @@ bool raw_mode(bool on) {
     static struct termios oldt;
     static bool saved = false;
     if (on) {
-        struct termios t;
+        struct termios t{};
         if (tcgetattr(STDIN_FILENO, &t) != 0) return false;
         if (!saved) { oldt = t; saved = true; }
         t.c_lflag &= ~(ICANON | ECHO | IEXTEN | ISIG);
@@ -319,10 +319,10 @@ std::string frame(const Frame& f) {
     s += std::string(static_cast<std::size_t>(cols > used ? cols - used : 0), ' ');
     s += "\x1b[K\n";
 
-    // ---- 第二行：F6 / F7 / F8 / DEL / F10（蓝色背景，方括号样式与顶栏槽位一致） ----
+    // ---- 第二行：F6 / F7 / F8 / F9 / DEL / F10（蓝色背景，方括号样式与顶栏槽位一致） ----
     s += "\x1b[44;37m";
     std::string bar = "[" + std::string(f.game_mode ? "F6 切换发送游戏命令/程序命令" : "F6 切换发送程序命令/游戏命令") + "]";
-    bar += std::string("    [F7 新增标签]    [F8 触发器]    [DEL 删除标签]    [F10 退出]");
+    bar += std::string("    [F7 新增标签]    [F8 触发器]    [F9 设置]    [DEL 删除标签]    [F10 退出]");
     s += fit(bar, static_cast<std::size_t>(cols), false);  // 超出 cols 时截断，绝不回绕
     s += std::string("\x1b[K") + RST + "\n";
 
@@ -473,7 +473,7 @@ std::string frame(const Frame& f) {
                 s += left_style + fit(left_content, static_cast<std::size_t>(leftW), false) + RST;
             s += BORDER;   // 右列与左列之间的分隔 |
             if (row_idx >= 0 && row_idx < log_h) {
-                std::size_t ri = static_cast<std::size_t>(row_idx);
+                auto ri = static_cast<std::size_t>(row_idx);
                 if (r_kind[ri] == 1)
                     s += r_lines[ri];                                // 徽标行：自带 ANSI 与填充
                 else if (r_kind[ri] == 2)
@@ -511,7 +511,7 @@ std::string frame(const Frame& f) {
             ++i;
         }
         // ---- 日志区：首行标题，其后为日志正文（↑↓ 滚动） ----
-        std::size_t tvis = static_cast<std::size_t>(log_content_h);
+        auto tvis = static_cast<std::size_t>(log_content_h);
         std::size_t t_avail = f.logs.size() > tvis ? f.logs.size() - tvis : 0;
         int off2 = f.scroll_offset < 0 ? 0 : f.scroll_offset;
         if (static_cast<std::size_t>(off2) > t_avail) off2 = static_cast<int>(t_avail);

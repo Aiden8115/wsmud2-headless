@@ -55,6 +55,23 @@ std::string format_exits(const json::Value& items) {
     return out;
 }
 
+// 自动施法：两次施法之间的最小间隔（对齐扩展智能模式的 300ms tick）
+constexpr int64_t AUTO_CAST_INTERVAL_MS = 300;
+
+// 自动施法：技能 → 它负责维持的 buff sid（非 buff 类技能返回空串）。
+// 对应扩展 wg-combat-auto.js 的 buff_skill_dict；内功类（force.*）在扩展里另有
+// force_buff_skill 白名单统一处理，这里归到 "force" buff（force.ztd / force.wang
+// 各归其专属 buff，与扩展的 ztd / mingyu 分类一致）。
+std::string buff_of_skill(const std::string& sid) {
+    if (sid == "sword.wu" || sid == "blade.shi" || sid == "sword.yu") return "weapon";
+    if (sid == "force.ztd") return "ztd";
+    if (sid == "force.wang") return "mingyu";
+    if (sid == "dodge.power" || sid == "dodge.fo" || sid == "dodge.gui" ||
+        sid == "dodge.lingbo" || sid == "dodge.zhui") return "dodge";
+    if (sid.rfind("force.", 0) == 0) return "force";
+    return "";
+}
+
 // JSON 值 → 字符串（数字尽量整数；null/缺键 → 空串）
 std::string val_str(const json::Value& v) {
     if (v.is_string()) return v.as_string();
@@ -72,6 +89,9 @@ std::string val_str(const json::Value& v) {
 
 }  // namespace
 
+// 全局设置表（声明见 mud.hpp）：角色名 → 玩家设置，由 commands.cpp 读/写 settings.json
+std::map<std::string, PlayerSettings> g_settings;
+
 void Account::set_stage(Stage s, int64_t now, int64_t timeout_ms) {
     stage = s;
     stage_deadline_ms = timeout_ms > 0 ? now + timeout_ms : 0;
@@ -82,6 +102,10 @@ void Account::enter_disconnected(const std::string& reason) {
     http.close();
     last_error = reason;
     set_stage(Stage::Disconnected, now_ms(), 0);
+    // 自动施法依赖的服务器状态在断线后失效，清空以免重连后用过期的技能表/冷却
+    my_skills.clear();
+    my_cd_until.clear();
+    my_gcd_until = 0;
     stop_trig_worker();   // 退出 worker 并释放 QuickJS 运行时（断线/失败后触发器停止）
     log("[断开] " + reason + "（输入 reconnect " + std::to_string(index) + " 重连）");
 }
@@ -242,6 +266,8 @@ void Account::tick(int64_t now) {
             }
             for (auto& m : msgs) on_message(m);
             update_idle(now);
+            auto_perform_tick(now);
+            auto_marry_tick(now);
             // 触发器心跳：合并——绑定 worker 队列里已有待执行 tick 则跳过本帧，避免重脚本时积压
             if (WorkerPool::instance().qempty(worker_))
                 enqueue_trig([this, now] { trig.tick(now); });
@@ -381,9 +407,35 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
             // 会导致冷却时长恒为 0、冷却表立即过期，(:cd) 恒判 false）
             const std::string rtime = val_str(v.get("rtime"));
             const std::string distime = val_str(v.get("distime"));
+            // 自动施法：主线程记录技能冷却与公共冷却的绝对到期时刻（与扩展 WG.cds / WG.gcd 一致）
+            const int64_t t = now_ms();
+            int64_t r_ms = 0, d_ms = 0;
+            if (double_to_i64(v.get("rtime").as_number(), r_ms) && r_ms > 0)
+                my_gcd_until = t + r_ms;
+            const std::string pfm_id = v.get("id").as_string();
+            if (!pfm_id.empty() && double_to_i64(v.get("distime").as_number(), d_ms) && d_ms > 0)
+                my_cd_until[pfm_id] = t + d_ms;
             enqueue_trig([this, v, rtime, distime] {
                 trig.on_dispfm(v.get("id").as_string(), rtime, distime, now_ms());
             });
+        } else if (type == "clearDistime") {
+            // 服务器清空所有技能冷却（扩展 clearDistime 分支）
+            my_cd_until.clear();
+            my_gcd_until = 0;
+        } else if (type == "enapfm") {
+            // 某技能冷却提前结束（扩展 enapfm 分支）
+            const std::string id = v.get("id").as_string();
+            if (!id.empty()) my_cd_until.erase(id);
+        } else if (type == "perform") {
+            // 可释放技能列表：自动施法据此按顺序轮换。元素可能是对象 {id:...} 或裸字符串
+            my_skills.clear();
+            const auto& arr = v.get("skills");
+            if (arr.is_array())
+                for (const auto& s : arr.as_array()) {
+                    const std::string id = s.is_string() ? s.as_string() : val_str(s.get("id"));
+                    if (!id.empty()) my_skills.push_back(id);
+                }
+            publish_state();
         } else if (type == "sc") {
             trig_on_sc(v);
         } else if (type == "items") {
@@ -435,7 +487,7 @@ void Account::on_json(const json::Value& v, const std::string& raw) {
         if (dialog == "pack") trig_on_pack(v);
         else if (dialog == "message") trig_on_social(v);
         else if (dialog == "pm") trig_on_pm(v);
-        else if (dialog == "events") trig_on_events(v);
+        else if (dialog == "events") { trig_on_events(v); auto_marry_on_events(v); }
     }
     // 已被右侧"房间"区消费的包（room/exits/items/itemadd/itemremove）不再记入网络包栏，避免污染
     if (type == "room" || type == "exits" || type == "items" ||
@@ -497,6 +549,19 @@ void Account::init_triggers() {
     my_name = role.name;
     my_level = role.level;
     my_state_text = "发呆";
+    // 按角色名应用本玩家的持久化设置（settings.json；无记录则保持默认关闭）
+    {
+        auto it = g_settings.find(my_name);
+        if (it != g_settings.end()) {
+            auto_perform = it->second.auto_perform;
+            auto_marry = it->second.auto_marry;
+        } else {
+            auto_perform = false;
+            auto_marry = false;
+        }
+        my_cast_next_ms = 0;
+        marry_step_ms = 0;
+    }
     my_room_name.clear();
     my_hp = my_max_hp = my_mp = my_max_mp = 0;
     my_living = true;
@@ -530,6 +595,80 @@ void Account::update_idle(int64_t now) {
     if (idle && my_idle_start_ms == 0) my_idle_start_ms = now;
     if (!idle) my_idle_start_ms = 0;
     my_idle = idle;
+}
+
+bool Account::is_free() const {
+    // 与扩展 WG.is_free 一致：busy/faint/rash/bss 任一在场都不可施法
+    return !my_status.count("busy") && !my_status.count("faint") &&
+           !my_status.count("rash") && !my_status.count("bss");
+}
+
+void Account::set_auto_perform(bool on) {
+    auto_perform = on;
+    my_cast_next_ms = 0;
+    log(std::string("自动施法") + (on ? "开启（智能模式）" : "关闭"));
+}
+
+void Account::set_auto_marry(bool on) {
+    auto_marry = on;
+    marry_step_ms = 0;
+    log(std::string("自动喜宴") + (on ? "开启" : "关闭"));
+}
+
+void Account::auto_perform_tick(int64_t now) {
+    if (!auto_perform || !my_combat || !my_living) return;  // 仅战斗中自动施法
+    if (now < my_cast_next_ms) return;                      // 施法节流
+    if (now < my_gcd_until) return;                         // 公共冷却中
+    if (!is_free()) return;                                 // 疗伤/晕/忙等状态中不施法
+
+    // 第一阶段：补 buff —— 按技能列表顺序，找"该技能负责且当前缺失"的 buff。
+    // force.tuoli（脱力）不能主动释放，与扩展的固定黑名单一致。
+    for (const auto& sid : my_skills) {
+        if (sid == "force.tuoli") continue;
+        const std::string buff = buff_of_skill(sid);
+        if (buff.empty() || my_status.count(buff)) continue;
+        auto it = my_cd_until.find(sid);
+        if (it != my_cd_until.end() && it->second > now) continue;   // 技能冷却中
+        ws.send_text("perform " + sid);
+        my_cast_next_ms = now + AUTO_CAST_INTERVAL_MS;
+        return;
+    }
+
+    // 第二阶段：主攻 —— 列表顺序中第一个"非 buff 类且不在冷却"的技能
+    for (const auto& sid : my_skills) {
+        if (sid == "force.tuoli") continue;
+        if (!buff_of_skill(sid).empty()) continue;
+        auto it = my_cd_until.find(sid);
+        if (it != my_cd_until.end() && it->second > now) continue;
+        ws.send_text("perform " + sid);
+        my_cast_next_ms = now + AUTO_CAST_INTERVAL_MS;
+        return;
+    }
+}
+
+// 自动喜宴（对齐扩展 wg-combat-extra.js 的 xiyan）：
+// 发现活动列表含 "marry" 时，先发 stopstate 停止当前状态，1 秒后发 events marry ok 领取。
+void Account::auto_marry_on_events(const json::Value& v) {
+    if (!auto_marry || !my_living || my_combat) return;   // 与扩展一致：战斗中不自动领取
+    if (marry_step_ms != 0) return;                       // 上一次领取尚未发完，避免重复
+    const auto& items = v.get("items");
+    if (!items.is_array()) return;
+    for (const auto& item : items.as_array()) {
+        if (!item.is_array()) continue;
+        const auto& arr = item.as_array();
+        if (arr.empty() || val_str(arr[0]) != "marry") continue;
+        ws.send_text("stopstate");
+        log("自动喜宴：发现喜宴活动，已发送 stopstate，1 秒后领取");
+        marry_step_ms = now_ms() + 1000;
+        return;
+    }
+}
+
+void Account::auto_marry_tick(int64_t now) {
+    if (marry_step_ms == 0 || now < marry_step_ms) return;
+    marry_step_ms = 0;
+    ws.send_text("events marry ok");
+    log("自动喜宴：已领取喜宴（events marry ok）");
 }
 
 std::string Account::state_word(const std::string& raw) {
@@ -732,6 +871,7 @@ void Account::trig_on_status(const json::Value& v) {
         if (id == role.id) {   // 扩展 _monitorStatus：busy/faint/rash 跟踪
             if (action == "add") my_status.insert(s);
             else if (action == "remove") my_status.erase(s);
+            else if (action == "clear") my_status.clear();   // 服务器一次性清空全部 buff
         }
         sids.push_back(s);
     };

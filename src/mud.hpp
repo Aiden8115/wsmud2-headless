@@ -2,6 +2,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -42,6 +43,16 @@ struct Role {
     std::string title;
     int level = 0;
 };
+
+// 玩家级设置（按角色名隔离，持久化于软件同级 settings.json 的 players 表）
+struct PlayerSettings {
+    bool auto_perform = false;   // 自动施法（战斗中智能释放技能）
+    bool auto_marry = false;     // 自动喜宴（活动喜宴自动领取）
+};
+
+// 全局设置表：角色名 → 设置。由 commands.cpp 从 settings.json 加载/写回；
+// Account 进入游戏（拿到角色名）时按此表应用，并在 F9 设置屏开关后同步写回。
+extern std::map<std::string, PlayerSettings> g_settings;
 
 // 日志输出回调（由 main 提供，统一带账号前缀）
 using LogFn = void (*)(int index, const std::string& line);
@@ -121,6 +132,15 @@ public:
     int64_t my_idle_start_ms = 0;  // 本次发呆起点（连续秒数 idle_time 计算）
     std::set<std::string> my_status; // 生效中的 buff sid（busy/faint/rash → :free）
 
+    // ---------- 自动施法（智能模式）/ 自动喜宴（F9 设置屏，按玩家持久化于 settings.json） ----------
+    bool auto_perform = false;                   // 自动施法开关；仅 Online 且在战斗中生效
+    bool auto_marry = false;                     // 自动喜宴开关；非战斗时发现喜宴活动即自动领取
+    int64_t marry_step_ms = 0;                   // 自动喜宴：>0 表示已发 stopstate，等待该时刻发 events marry ok
+    std::vector<std::string> my_skills;          // 服务器 perform 包下发的可释放技能 id（顺序＝优先级）
+    std::map<std::string, int64_t> my_cd_until;  // 技能 id → 冷却结束时刻（ms）
+    int64_t my_gcd_until = 0;                    // 公共冷却（dispfm.rtime）结束时刻（ms）
+    int64_t my_cast_next_ms = 0;                 // 施法节流：下次允许发包的时刻（ms）
+
     // 启动登录：拉取服务器列表
     void start_login();
     // 选择服务器（main 交互调用）
@@ -142,6 +162,15 @@ public:
     // 触发器：选角色后初始化（加载触发器文件），并构造脚本状态 JSON
     void init_triggers();
     void update_idle(int64_t now);
+
+    // 自动施法（智能模式，对齐扩展 wg-combat-auto.js）：
+    // 战斗中优先补缺失的 buff 技能，其次按技能列表顺序释放主攻技能；
+    // 受公共冷却、技能冷却与"空闲"状态约束，脱离战斗自动停止。
+    void set_auto_perform(bool on);      // F9 设置屏：切换自动施法开关
+    void set_auto_marry(bool on);        // F9 设置屏：切换自动喜宴开关
+    bool is_free() const;                // 无 busy/faint/rash/bss（可施法）
+    void auto_perform_tick(int64_t now); // 主循环每帧驱动
+    void auto_marry_tick(int64_t now);   // 自动喜宴：到点补发 events marry ok
 
     // 触发器按玩家隔离：注入全局配置并同步到本账号引擎。
     // 引擎只执行"该玩家私有(owner==my_name)"与"全局共享(owner 空)"的触发器；
@@ -197,6 +226,7 @@ private:
     void trig_on_status(const json::Value& v);
     void trig_on_pm(const json::Value& v);
     void trig_on_events(const json::Value& v);
+    void auto_marry_on_events(const json::Value& v);  // 自动喜宴：events 包中发现 marry 即领取
     void trig_on_pack(const json::Value& v);
     void trig_on_social(const json::Value& v);
     static std::string state_word(const std::string& raw);   // state 文本 → 状态关键词

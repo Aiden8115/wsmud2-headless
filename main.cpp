@@ -35,6 +35,7 @@ View view = View::Logs;
 std::vector<ClickZone> g_zones;
 std::vector<wsmud::trigger::Trigger> g_trig_cfg;  // 当前生效的全局触发器配置（trigger.json，程序只读）
 TrigEditor trig_editor;                          // F8 触发器编辑屏状态（TUI 内）
+int settings_cursor = 0;                         // F9 设置屏焦点项（0=自动施法 1=自动喜宴）
 
 // ---------- 输出 ----------
 
@@ -249,6 +250,7 @@ void startup_prompt() {
         a.set_chat(account_chat);
     }
     reload_triggers();  // 经典模式：启动即加载 trigger.json
+    load_settings();    // 经典模式：启动即加载 settings.json（按玩家设置）
 
     for (std::size_t i = 0; i < accounts.size(); ++i) {
         auto& a = *accounts[i];
@@ -387,6 +389,7 @@ int main() {
             accounts[i]->set_packet(account_packet);
         }
         reload_triggers();  // 启动即加载 trigger.json（不存在则创建空模板）
+        load_settings();    // 启动即加载 settings.json（按玩家设置长期存储）
         refresh_input_state();  // 初次进入：选中 F1 未配置 → 立即提示录入账号
         tui_run_loop();
         tui::raw_mode(false);
